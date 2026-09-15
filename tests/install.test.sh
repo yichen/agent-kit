@@ -36,6 +36,7 @@ test -f "$TEST_HOME/.agents/skills/qwen-delegate.pre-agent-kit-test/sentinel"
 test "$(readlink "$TEST_HOME/.claude/skills/qwen-delegate")" = "$TEST_HOME/.agents/skills/qwen-delegate"
 test "$(readlink "$TEST_HOME/.pi/agent/skills/qwen-delegate")" = "$TEST_HOME/.agents/skills/qwen-delegate"
 grep -Fq "$TEST_HOME/.agents/skills/qwen-delegate/scripts/ollama-delegate.sh" "$TEST_HOME/Library/LaunchAgents/com.yichen.sharedanchor-ollama-delegate-warm.plist"
+grep -Fq "$TEST_HOME/.agents/skills/qwen-delegate/scripts/qwen-delegate-report.sh" "$TEST_HOME/Library/LaunchAgents/com.yichen.sharedanchor-ollama-delegate-report.plist"
 
 "$INSTALLER" install > "$TEST_ROOT/reinstall.out"
 "$INSTALLER" check > "$TEST_ROOT/final-check.out"
@@ -58,6 +59,15 @@ drift_status=$?
 set -e
 test "$drift_status" -eq 2
 grep -Fq 'warm service plist drift detected' "$TEST_ROOT/drift.err"
+
+"$INSTALLER" install > "$TEST_ROOT/repair.out"
+printf '\n# drift\n' >> "$TEST_HOME/Library/LaunchAgents/com.yichen.sharedanchor-ollama-delegate-report.plist"
+set +e
+"$INSTALLER" check > "$TEST_ROOT/report-drift.out" 2> "$TEST_ROOT/report-drift.err"
+report_drift_status=$?
+set -e
+test "$report_drift_status" -eq 2
+grep -Fq 'report service plist drift detected' "$TEST_ROOT/report-drift.err"
 
 while IFS='|' read -r name expected_status; do
   fixture="$TEST_ROOT/name-$expected_status-$(printf '%s' "$name" | shasum -a 256 | cut -c1-8)"
