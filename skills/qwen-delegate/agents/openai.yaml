@@ -1,0 +1,4 @@
+interface:
+  display_name: "Qwen Delegate"
+  short_description: "Fast, bounded local Qwen advisory microtasks"
+  default_prompt: "Use $qwen-delegate for eligible short advisory portions, verify any result, and fall back immediately if unavailable."
