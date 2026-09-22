@@ -155,14 +155,20 @@ cmd_record() {
 cmd_gate() {
   local workdir="${1:-}"; shift || true
   [ -d "$workdir" ] || die "workdir not found: $workdir"
-  local blocking=""
+  local blocking="" ready=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --blocking) blocking="${2:-}"; shift 2 ;;
+      --ready) ready="${2:-}"; shift 2 ;;
       *) die "unknown gate option: $1" ;;
     esac
   done
   [ -n "$blocking" ] || die "gate needs --blocking <count>"
+  [ -n "$ready" ] || die "gate needs --ready <pass|fail>, from plan-review-readiness.sh check"
+  case "$ready" in
+    pass|fail) ;;
+    *) die "gate --ready must be pass or fail, got: $ready" ;;
+  esac
   case "$blocking" in
     ''|*[!0-9]*) die "gate --blocking must be a number, got: $blocking" ;;
   esac
@@ -178,8 +184,14 @@ cmd_gate() {
 
   local decision=""
 
-  if [ "$blocking" -eq 0 ]; then
-    decision="STOP approved no blocking finding in round $round"
+  # No blocking finding means no defect was found. It does not mean the plan is
+  # ready to implement. A plan can be true, consistent, and still be missing the
+  # scope, acceptance criteria and verification a run needs, in which case the
+  # run re-plans from scratch and this review bought nothing.
+  if [ "$blocking" -eq 0 ] && [ "$ready" = "pass" ]; then
+    decision="STOP approved no blocking finding in round $round and the plan is ready to implement"
+  elif [ "$blocking" -eq 0 ] && [ "$ready" = "fail" ]; then
+    decision="STOP not-ready no blocking finding in round $round but the plan is missing what an implementation run requires; see the readiness check in the log"
   fi
 
   if [ -z "$decision" ] && [ "$repo" != "-" ] && [ "$base" != "-" ]; then
@@ -229,7 +241,7 @@ main() {
     record) cmd_record "$@" ;;
     gate) cmd_gate "$@" ;;
     status) cmd_status "$@" ;;
-    *) die "usage: $0 init <plan> [--repo <path>] [--base <sha>] | round-start <workdir> | record <workdir> --brief <b> --verdict <v> --finding <text> [--edit <text>] [--check <cmd>] | gate <workdir> --blocking <n> | status <workdir>" ;;
+    *) die "usage: $0 init <plan> [--repo <path>] [--base <sha>] | round-start <workdir> | record <workdir> --brief <b> --verdict <v> --finding <text> [--edit <text>] [--check <cmd>] | gate <workdir> --blocking <n> --ready <pass|fail> | status <workdir>" ;;
   esac
 }
 
