@@ -126,9 +126,10 @@ None of them notices that something required is absent, so a plan can be entirel
 The check looks for what `/code` and `/implement` need: a pinned base commit, the set of files to change, at least one anchor a later run can verify against current source, at least one acceptance criterion stating an observable result, and at least one verification obligation.
 A plan may carry these in a `code-pre-reviewed-plan:v1` block, which is checked field by field, or in prose, where the check looks for file:line references and the matching sections.
 
-When the target repository ships `.agents_shared/code/code-controller.mjs`, the check also runs that controller's read-only dry run and reports its route.
-`FULL_PLANNING_REQUIRED` and `BLOCKED` both mean the plan is not ready: the first throws the reviewed plan away and plans again from scratch, so the review bought nothing.
-Repositories without that controller are normal, and the check falls back to its own rules.
+The check does not call a repository's own plan controller.
+SharedAnchor's `code-controller.mjs` refuses to answer outside an active `/code` lifecycle, so a call from here can never return a route.
+The rules above mirror what that controller requires, and it performs its own routing when the plan reaches it.
+A plan that fails this check is one `/code` would route to `FULL_PLANNING_REQUIRED`, which throws the reviewed plan away and plans again from scratch, so the review bought nothing.
 
 `scripts/plan-review-readiness.sh scaffold <workdir>` prints a starting block with the repository and the pinned base already filled, plus the paths the context pack resolved as scope candidates.
 It leaves scope, anchors, acceptance criteria and verification empty on purpose.
