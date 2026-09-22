@@ -39,3 +39,16 @@ Run every tracked skill and installer test:
 
 Develop changes in a sibling Git worktree.
 Merge reviewed changes into `main`, then fast-forward this checkout so every host runtime sees the tested version.
+
+## Skills
+
+### plan-review
+
+Reviews a plan file before implementation starts.
+Invoke as `/plan-review plan:<absolute-path>`.
+
+It dispatches three reviewers at once holding different briefs, applies the smallest edit that closes each blocking finding, then re-reviews the edit rather than the whole plan.
+A hard cap of three rounds cannot be raised by an argument.
+
+It exists because plan reviews that iterate without a stopping rule run for hours.
+The measured worst case on this host ran 39 revisions and 67 review dispatches over 27 hours.
