@@ -45,6 +45,11 @@ Each entry says whether the path exists, and for a path that exists, its size an
 
 Read `<workdir>/context.md` before dispatching anything.
 Its purpose is to stop a reviewer from spending a round on its own failed search.
+
+The context pack is also where background belongs.
+A plan padded with context is harder to review and raises the round 1 byte count the growth rule measures against, which blunts that stop rule.
+Move background out of the plan and into the pack, and leave the plan as the scope, the steps, the acceptance criteria and the verification.
+`/code` does not read the plan's prose to its reviewers at all, so context written to persuade a reviewer is wasted there.
 One measured round was lost to a reviewer reporting that no caller existed for a script when the caller was on disk the whole time, and that false finding then cost a second round to undo.
 
 ### Step 2. Round 1 only: dispatch three reviewers at once
@@ -109,17 +114,42 @@ A logged entry with no re-runnable check recorded against it cannot overrule a n
 
 Keeping reviewers out of the log is what stops this from becoming the pattern that made the 27 hour loop expensive, where round 20 was pointed at reviews v1 through v19 and the cost of a round grew with the round number.
 
-### Step 6. Stop
+### Step 6. Check that the plan is implementable
 
-Run `scripts/plan-review-state.sh gate <workdir> --blocking <count>` after every round.
+Run `scripts/plan-review-readiness.sh check <workdir>`.
+It prints `READY` and exits 0, or `NOT-READY` with one line per missing item and exits 11.
+
+Finding no defects is not the same as being ready.
+The three briefs all look for things that are wrong.
+None of them notices that something required is absent, so a plan can be entirely true, internally consistent, with every part earning its place, and still leave an implementation run to re-derive its scope and acceptance criteria.
+
+The check looks for what `/code` and `/implement` need: a pinned base commit, the set of files to change, at least one anchor a later run can verify against current source, at least one acceptance criterion stating an observable result, and at least one verification obligation.
+A plan may carry these in a `code-pre-reviewed-plan:v1` block, which is checked field by field, or in prose, where the check looks for file:line references and the matching sections.
+
+The check does not call a repository's own plan controller.
+SharedAnchor's `code-controller.mjs` refuses to answer outside an active `/code` lifecycle, so a call from here can never return a route.
+The rules above mirror what that controller requires, and it performs its own routing when the plan reaches it.
+A plan that fails this check is one `/code` would route to `FULL_PLANNING_REQUIRED`, which throws the reviewed plan away and plans again from scratch, so the review bought nothing.
+
+`scripts/plan-review-readiness.sh scaffold <workdir>` prints a starting block with the repository and the pinned base already filled, plus the paths the context pack resolved as scope candidates.
+It leaves scope, anchors, acceptance criteria and verification empty on purpose.
+Those are judgments about the work, and a guessed block would pass the check while describing the wrong change.
+
+### Step 7. Stop
+
+Run `scripts/plan-review-state.sh gate <workdir> --blocking <count> --ready <pass|fail>` after every round.
 It prints one line and exits 0 to continue or 10 to stop.
 Its decision is authoritative.
+It refuses to decide without both answers, so an unrun check cannot read as approval.
 
 It stops on any of these.
 
-- No reviewer reported a blocking finding.
-  The plan is approved.
+- No reviewer reported a blocking finding, and the readiness check passed.
+  The plan is approved and can go straight to `/implement plan:<path>` or `/code plan:<path>`.
   Findings below blocking are written into the plan as known and accepted, and do not start another round.
+- No reviewer reported a blocking finding, but the readiness check failed.
+  The plan is correct and not yet implementable.
+  Report the missing items. Filling them is an edit like any other, and it starts another round.
 - Three rounds have completed.
   Report the open findings. Do not silently continue.
 - The pinned base has moved.

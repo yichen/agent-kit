@@ -57,7 +57,7 @@ for n in 1 2 3 4 5 6 7 8 9 10; do
 
   # The reviewer never approves. There is always one blocking finding left.
   set +e
-  out="$("$STATE" gate "$wd" --blocking 1)"; code=$?
+  out="$("$STATE" gate "$wd" --blocking 1 --ready fail)"; code=$?
   set -e
   if [ "$code" -eq 10 ]; then
     stop_line="$out"
