@@ -9,6 +9,7 @@ PRIMARY_ROOT="${AGENT_KIT_PRIMARY_SKILLS_ROOT:-$USER_HOME/.agents/skills}"
 CODEX_ROOT="${AGENT_KIT_CODEX_SKILLS_ROOT:-$USER_HOME/.codex/skills}"
 CLAUDE_ROOT="${AGENT_KIT_CLAUDE_SKILLS_ROOT:-$USER_HOME/.claude/skills}"
 PI_ROOT="${AGENT_KIT_PI_SKILLS_ROOT:-$USER_HOME/.pi/agent/skills}"
+BACKUP_ROOT="${AGENT_KIT_BACKUP_ROOT:-$USER_HOME/.agent-kit/backups}"
 MODE="${1:-}"
 ADOPT=0
 
@@ -56,18 +57,19 @@ preflight_target() {
 }
 
 backup_and_link() {
-  local target="$1" expected="$2"
+  local target="$1" expected="$2" runtime="$3"
   if expected_link "$target" "$expected"; then
     return 0
   fi
   if [ -e "$target" ] || [ -L "$target" ]; then
     local suffix backup
     suffix="${AGENT_KIT_BACKUP_SUFFIX:-$(date -u +%Y%m%dT%H%M%SZ)}"
-    backup="${target}.pre-agent-kit-${suffix}"
+    backup="$BACKUP_ROOT/$runtime/$(basename "$target").pre-agent-kit-${suffix}"
     [ ! -e "$backup" ] && [ ! -L "$backup" ] || {
       echo "agent-kit: backup already exists: $backup" >&2
       return 2
     }
+    mkdir -p "$(dirname "$backup")"
     mv "$target" "$backup"
   fi
   ln -s "$expected" "$target"
@@ -102,10 +104,10 @@ mkdir -p "$PRIMARY_ROOT" "$CODEX_ROOT" "$CLAUDE_ROOT" "$PI_ROOT"
 for skill_dir in "${skill_directories[@]}"; do
   skill_name="$(basename "$skill_dir")"
   primary="$PRIMARY_ROOT/$skill_name"
-  backup_and_link "$primary" "$skill_dir"
-  backup_and_link "$CODEX_ROOT/$skill_name" "$primary"
-  backup_and_link "$CLAUDE_ROOT/$skill_name" "$primary"
-  backup_and_link "$PI_ROOT/$skill_name" "$primary"
+  backup_and_link "$primary" "$skill_dir" agents
+  backup_and_link "$CODEX_ROOT/$skill_name" "$primary" codex
+  backup_and_link "$CLAUDE_ROOT/$skill_name" "$primary" claude
+  backup_and_link "$PI_ROOT/$skill_name" "$primary" pi
   if [ -x "$skill_dir/scripts/install-host-service.sh" ]; then
     AGENT_KIT_USER_HOME="$USER_HOME" AGENT_KIT_PRIMARY_SKILL_PATH="$primary" "$skill_dir/scripts/install-host-service.sh" install
   fi

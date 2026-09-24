@@ -31,12 +31,15 @@ set -e
 test "$without_adopt_status" -eq 2
 test -f "$TEST_HOME/.agents/skills/qwen-delegate/sentinel"
 test -f "$TEST_HOME/.codex/skills/q/sentinel"
+test ! -e "$TEST_HOME/.agent-kit"
 
 "$INSTALLER" install --adopt-existing > "$TEST_ROOT/adopt.out"
 test -L "$TEST_HOME/.agents/skills/qwen-delegate"
 test "$(readlink "$TEST_HOME/.agents/skills/qwen-delegate")" = "$ROOT/skills/qwen-delegate"
-test -f "$TEST_HOME/.agents/skills/qwen-delegate.pre-agent-kit-test/sentinel"
-test -f "$TEST_HOME/.codex/skills/q.pre-agent-kit-test/sentinel"
+test -f "$TEST_HOME/.agent-kit/backups/agents/qwen-delegate.pre-agent-kit-test/sentinel"
+test -f "$TEST_HOME/.agent-kit/backups/codex/q.pre-agent-kit-test/sentinel"
+test ! -e "$TEST_HOME/.agents/skills/qwen-delegate.pre-agent-kit-test"
+test ! -e "$TEST_HOME/.codex/skills/q.pre-agent-kit-test"
 test "$(readlink "$TEST_HOME/.agents/skills/q")" = "$ROOT/skills/q"
 test "$(readlink "$TEST_HOME/.codex/skills/q")" = "$TEST_HOME/.agents/skills/q"
 test "$(readlink "$TEST_HOME/.codex/skills/qwen-delegate")" = "$TEST_HOME/.agents/skills/qwen-delegate"
