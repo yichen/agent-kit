@@ -19,7 +19,7 @@ The first migration from an existing copied skill directory requires one explici
 ./install.sh install --adopt-existing
 ```
 
-Adoption moves the existing target beside itself with a timestamped suffix before creating the link.
+Adoption moves the existing target to `$HOME/.agent-kit/backups/<runtime>/` with a timestamped suffix before creating the link. Backups stay outside skill discovery directories.
 The installer is idempotent after the first successful run.
 
 Verify the links and any skill-specific host services without changing host state:
