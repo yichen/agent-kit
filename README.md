@@ -54,5 +54,5 @@ The measured worst case on this host ran 39 revisions and 67 review dispatches o
 
 ### q
 
-Delegates a `$q` prompt to a subagent and returns its answer in the calling Codex task.
-It does not post a dispatch notice or save the answer to a separate file.
+Forks the calling Codex task, sends the `$q` prompt to the fork, and returns a link immediately.
+The answer appears in the fork while the calling task remains available for new prompts.

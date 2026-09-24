@@ -1,17 +1,18 @@
 ---
 name: q
-description: Answer a prompt through a subagent and show its answer in the same Codex task. Use when the user invokes $q or types /q.
+description: Fork the current Codex task to answer a prompt in parallel and return its task link. Use when the user invokes $q or types /q.
 ---
 
-# Background question
+# Parallel question
 
-The text after `$q` (or a literal `/q` if the app passes it through) is the task. Delegate the answer to a subagent. The parent is a quiet relay; it must not answer the prompt itself.
+The text after `$q` (or a literal `/q` if the app passes it through) is the task. The calling task dispatches it to a fork and ends its turn so later prompts can run here. The answer appears in the forked task.
 
 1. If there is no task text, give one short usage example and stop.
-2. Spawn exactly one subagent with `fork_turns: "all"`. Give it the exact task text and ask it to complete the task, respect all applicable instructions and authorization boundaries, and return its full user-facing answer in its final message. Do not ask it to write an answer file. Do not use the `$do` single-file queue.
-3. Do not post a dispatch confirmation, agent name, progress update, or file path. Keep the parent turn open and wait quietly for the subagent's final answer. Then send that answer in this same task as the parent's final response. The final response should contain only the answer to the `$q` prompt, with no relay preface.
-4. If the user sends a correction while the subagent is working, pass it to the subagent. Continue waiting for the answer unless the user cancels the request. If no subagent slot is available, state briefly that the request could not start and why; do not answer it in the parent.
+2. Call `mcp__codex_app__fork_thread` with `environment: { type: "same-directory" }` and no `threadId` to copy this task's completed history. Do not use a collaboration subagent or keep this turn open waiting for the answer.
+3. The fork excludes this active turn. Send the exact task text to the returned `threadId` with `mcp__codex_app__send_message_to_thread`. Include any file paths or URLs supplied with this prompt that the fork needs. A same-directory fork should return `threadId` immediately; if it does not, stop without claiming the request started. Never send to `clientThreadId`.
+4. After the prompt is accepted, end this turn immediately with only a link to the new task: `[Open q task](codex://threads/<threadId>)`. Do not poll, monitor, relay its answer here, or post a separate dispatch update. The user can continue this task and follow up with the fork directly.
+5. If forking fails, say the request did not start. If the fork succeeds but sending the prompt fails, say that no work started and link to the empty fork. Do not claim that the request is running.
 
-The fork copies the conversation context available at dispatch, not later messages. If the parent's context has already been compacted, `fork_turns: "all"` cannot restore raw turns; have the child consult durable memory or transcripts when that history matters.
+The fork copies completed context available at dispatch, not later messages or attachments from this active turn. If an attachment has no accessible path or URL to pass along, say so rather than claiming the fork has it. Compaction cannot restore raw earlier turns; ask the fork to consult durable memory or transcripts when that history matters.
 
 Codex's documented direct skill invocation is `$q`. A plain `/q` works only when the app passes it through as message text and selects this skill; this file cannot register a built-in slash command.
