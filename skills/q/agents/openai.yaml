@@ -1,0 +1,4 @@
+interface:
+  display_name: "Q"
+  short_description: "Answer in a background agent with this chat's context"
+  default_prompt: "$q Give me a status update on the latest epic."

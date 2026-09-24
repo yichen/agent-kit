@@ -22,17 +22,24 @@ test "$before" = "$(find "$TEST_HOME" -mindepth 1 -print | sort)"
 
 mkdir -p "$TEST_HOME/.agents/skills/qwen-delegate"
 printf '%s\n' preserved > "$TEST_HOME/.agents/skills/qwen-delegate/sentinel"
+mkdir -p "$TEST_HOME/.codex/skills/q"
+printf '%s\n' preserved > "$TEST_HOME/.codex/skills/q/sentinel"
 set +e
 "$INSTALLER" install > "$TEST_ROOT/install.out" 2> "$TEST_ROOT/install.err"
 without_adopt_status=$?
 set -e
 test "$without_adopt_status" -eq 2
 test -f "$TEST_HOME/.agents/skills/qwen-delegate/sentinel"
+test -f "$TEST_HOME/.codex/skills/q/sentinel"
 
 "$INSTALLER" install --adopt-existing > "$TEST_ROOT/adopt.out"
 test -L "$TEST_HOME/.agents/skills/qwen-delegate"
 test "$(readlink "$TEST_HOME/.agents/skills/qwen-delegate")" = "$ROOT/skills/qwen-delegate"
 test -f "$TEST_HOME/.agents/skills/qwen-delegate.pre-agent-kit-test/sentinel"
+test -f "$TEST_HOME/.codex/skills/q.pre-agent-kit-test/sentinel"
+test "$(readlink "$TEST_HOME/.agents/skills/q")" = "$ROOT/skills/q"
+test "$(readlink "$TEST_HOME/.codex/skills/q")" = "$TEST_HOME/.agents/skills/q"
+test "$(readlink "$TEST_HOME/.codex/skills/qwen-delegate")" = "$TEST_HOME/.agents/skills/qwen-delegate"
 test "$(readlink "$TEST_HOME/.claude/skills/qwen-delegate")" = "$TEST_HOME/.agents/skills/qwen-delegate"
 test "$(readlink "$TEST_HOME/.pi/agent/skills/qwen-delegate")" = "$TEST_HOME/.agents/skills/qwen-delegate"
 grep -Fq "$TEST_HOME/.agents/skills/qwen-delegate/scripts/ollama-delegate.sh" "$TEST_HOME/Library/LaunchAgents/com.yichen.sharedanchor-ollama-delegate-warm.plist"
@@ -51,6 +58,17 @@ test "$wrong_status" -eq 2
 test "$(readlink "$TEST_HOME/.pi/agent/skills/qwen-delegate")" = "$TEST_ROOT/wrong-target"
 rm "$TEST_HOME/.pi/agent/skills/qwen-delegate"
 ln -s "$TEST_HOME/.agents/skills/qwen-delegate" "$TEST_HOME/.pi/agent/skills/qwen-delegate"
+
+rm "$TEST_HOME/.codex/skills/q"
+ln -s "$TEST_ROOT/wrong-target" "$TEST_HOME/.codex/skills/q"
+set +e
+"$INSTALLER" install > "$TEST_ROOT/wrong-codex.out" 2> "$TEST_ROOT/wrong-codex.err"
+wrong_codex_status=$?
+set -e
+test "$wrong_codex_status" -eq 2
+test "$(readlink "$TEST_HOME/.codex/skills/q")" = "$TEST_ROOT/wrong-target"
+rm "$TEST_HOME/.codex/skills/q"
+ln -s "$TEST_HOME/.agents/skills/q" "$TEST_HOME/.codex/skills/q"
 
 printf '\n# drift\n' >> "$TEST_HOME/Library/LaunchAgents/com.yichen.sharedanchor-ollama-delegate-warm.plist"
 set +e
