@@ -3,8 +3,7 @@
 This repository is the source of truth for personal host-scoped agent skills.
 The checkout stays at `$HOME/work/agent-kit` on `main`.
 Each installed skill is an absolute symbolic link from `$HOME/.agents/skills/<name>` to `skills/<name>` in this checkout.
-Claude Code and Pi use adapter links that point back to the same primary link.
-Codex reads the primary skill directory directly.
+Codex, Claude Code, and Pi use adapter links that point back to the same primary link.
 
 ## Install the skills
 
@@ -52,3 +51,8 @@ A hard cap of three rounds cannot be raised by an argument.
 
 It exists because plan reviews that iterate without a stopping rule run for hours.
 The measured worst case on this host ran 39 revisions and 67 review dispatches over 27 hours.
+
+### q
+
+Delegates a `$q` prompt to a subagent and returns its answer in the calling Codex task.
+It does not post a dispatch notice or save the answer to a separate file.

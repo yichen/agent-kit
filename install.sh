@@ -6,6 +6,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 USER_HOME="${AGENT_KIT_USER_HOME:-$HOME}"
 PRIMARY_ROOT="${AGENT_KIT_PRIMARY_SKILLS_ROOT:-$USER_HOME/.agents/skills}"
+CODEX_ROOT="${AGENT_KIT_CODEX_SKILLS_ROOT:-$USER_HOME/.codex/skills}"
 CLAUDE_ROOT="${AGENT_KIT_CLAUDE_SKILLS_ROOT:-$USER_HOME/.claude/skills}"
 PI_ROOT="${AGENT_KIT_PI_SKILLS_ROOT:-$USER_HOME/.pi/agent/skills}"
 MODE="${1:-}"
@@ -76,6 +77,7 @@ for skill_dir in "${skill_directories[@]}"; do
   skill_name="$(basename "$skill_dir")"
   primary="$PRIMARY_ROOT/$skill_name"
   preflight_target "$primary" "$skill_dir"
+  preflight_target "$CODEX_ROOT/$skill_name" "$primary"
   preflight_target "$CLAUDE_ROOT/$skill_name" "$primary"
   preflight_target "$PI_ROOT/$skill_name" "$primary"
 done
@@ -85,6 +87,7 @@ if [ "$MODE" = "check" ]; then
     skill_name="$(basename "$skill_dir")"
     primary="$PRIMARY_ROOT/$skill_name"
     expected_link "$primary" "$skill_dir" || { echo "agent-kit: primary link mismatch: $primary" >&2; exit 2; }
+    expected_link "$CODEX_ROOT/$skill_name" "$primary" || { echo "agent-kit: Codex link mismatch: $CODEX_ROOT/$skill_name" >&2; exit 2; }
     expected_link "$CLAUDE_ROOT/$skill_name" "$primary" || { echo "agent-kit: Claude link mismatch: $CLAUDE_ROOT/$skill_name" >&2; exit 2; }
     expected_link "$PI_ROOT/$skill_name" "$primary" || { echo "agent-kit: Pi link mismatch: $PI_ROOT/$skill_name" >&2; exit 2; }
     if [ -x "$skill_dir/scripts/install-host-service.sh" ]; then
@@ -95,11 +98,12 @@ if [ "$MODE" = "check" ]; then
   exit 0
 fi
 
-mkdir -p "$PRIMARY_ROOT" "$CLAUDE_ROOT" "$PI_ROOT"
+mkdir -p "$PRIMARY_ROOT" "$CODEX_ROOT" "$CLAUDE_ROOT" "$PI_ROOT"
 for skill_dir in "${skill_directories[@]}"; do
   skill_name="$(basename "$skill_dir")"
   primary="$PRIMARY_ROOT/$skill_name"
   backup_and_link "$primary" "$skill_dir"
+  backup_and_link "$CODEX_ROOT/$skill_name" "$primary"
   backup_and_link "$CLAUDE_ROOT/$skill_name" "$primary"
   backup_and_link "$PI_ROOT/$skill_name" "$primary"
   if [ -x "$skill_dir/scripts/install-host-service.sh" ]; then
