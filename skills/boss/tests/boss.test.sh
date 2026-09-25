@@ -138,18 +138,31 @@ run ticket launch --repo "$REPO" --issue 3 --adapter "$ADAPTER" --apply --phase 
 run ticket add --repo "$REPO" --issue 4 --kind feature > /dev/null
 GEN4="$(ops claim --issue 4 --phase implement --owner boss-A | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
 ACTION4="$(ops reserve --issue 4 --phase implement --owner boss-A --generation "$GEN4" --verb launch | python3 -c 'import json,sys;print(json.load(sys.stdin)["action"]["action_id"])')"
+python3 - "$STATE" "$ACTION4" <<'PY'
+import json,sys
+path,action=sys.argv[1:]
+data=json.load(open(path)); ticket=data['tickets']['4']; ticket.update(status='launching',action_id=action); json.dump(data,open(path,'w'))
+PY
 python3 - "$ROOT/no-tasks.json" <<'PY'
 import datetime,json,sys
 json.dump({'as_of':datetime.datetime.now(datetime.timezone.utc).isoformat(),'tasks':[]},open(sys.argv[1],'w'))
 PY
 run ticket abandon --repo "$REPO" --issue 4 --action-id "$ACTION4" --phase implement --owner boss-A --generation "$GEN4" --inventory "$ROOT/no-tasks.json" --evidence 'Fresh inventory confirms no task was created' > /dev/null
+python3 - "$STATE" <<'PY'
+import json,sys
+ticket=json.load(open(sys.argv[1]))['tickets']['4']; assert ticket['status']=='ready' and 'action_id' not in ticket
+PY
 run ticket launch --repo "$REPO" --issue 4 --adapter "$ADAPTER" --apply --phase implement --owner boss-A --generation "$GEN4" > /dev/null
 run ticket add --repo "$REPO" --issue 5 --kind feature > /dev/null
 GEN5="$(ops claim --issue 5 --phase implement --owner boss-A | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
 ACTION5="$(ops reserve --issue 5 --phase implement --owner boss-A --generation "$GEN5" --verb launch | python3 -c 'import json,sys;print(json.load(sys.stdin)["action"]["action_id"])')"
-ops ack --issue 5 --phase implement --generation "$GEN5" --action-id "$ACTION5" --task-id task-2 > /dev/null
+ops ack --issue 5 --phase implement --owner boss-A --generation "$GEN5" --action-id "$ACTION5" --task-id task-2 > /dev/null
 expect_fail 'compare-and-set failed' ticket confirm --repo "$REPO" --issue 5 --action-id wrong --task-id task-2 --phase implement --owner boss-A --generation "$GEN5"
+expect_fail 'stale generation or owner' ticket confirm --repo "$REPO" --issue 5 --action-id "$ACTION5" --task-id task-2 --phase implement --owner boss-B --generation "$GEN5"
 run ticket confirm --repo "$REPO" --issue 5 --action-id "$ACTION5" --task-id task-2 --phase implement --owner boss-A --generation "$GEN5" > /dev/null
+run ticket confirm --repo "$REPO" --issue 5 --action-id "$ACTION5" --task-id task-2 --phase implement --owner boss-A --generation "$GEN5" > /dev/null
+expect_fail 'launch confirmation precondition failed' ticket confirm --repo "$REPO" --issue 5 --action-id "$ACTION5" --task-id task-other --phase implement --owner boss-A --generation "$GEN5"
+expect_fail 'launch confirmation precondition failed' ticket confirm --repo "$REPO" --issue 5 --action-id ACTION-other --task-id task-2 --phase implement --owner boss-A --generation "$GEN5"
 expect_ops_fail 'unverified action' release --issue 5 --phase implement --owner boss-A --generation "$GEN5"
 python3 - "$ROOT/issue-5-inventory.json" "$ACTION5" <<'PY'
 import datetime,json,sys

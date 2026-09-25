@@ -217,16 +217,16 @@ def abandon(con, db_path, repo, issue, phase, owner, generation, aid, inventory,
             raise
 
 
-def acknowledge(con, repo, issue, phase, generation, aid, task_id):
+def acknowledge(con, repo, issue, phase, owner, generation, aid, task_id):
     task_id = valid_id(task_id, "task ID")
     begin(con)
     try:
-        active = con.execute("SELECT 1 FROM claims WHERE repo=? AND issue=? AND phase=? AND generation=? AND status='active'", (repo, issue, phase, generation)).fetchone()
+        active = con.execute("SELECT 1 FROM claims WHERE repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='active'", (repo, issue, phase, owner, generation)).fetchone()
         if not active:
-            raise ValueError("stale generation: acknowledgment rejected")
-        changed = con.execute("UPDATE actions SET status='acknowledged',task_id=?,acknowledged_at=? WHERE action_id=? AND repo=? AND issue=? AND phase=? AND generation=? AND status='reserved'", (task_id, timestamp(), aid, repo, issue, phase, generation)).rowcount
+            raise ValueError("stale generation or owner: acknowledgment rejected")
+        changed = con.execute("UPDATE actions SET status='acknowledged',task_id=?,acknowledged_at=? WHERE action_id=? AND repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='reserved'", (task_id, timestamp(), aid, repo, issue, phase, owner, generation)).rowcount
         if not changed:
-            existing = con.execute("SELECT status,task_id FROM actions WHERE action_id=? AND repo=? AND issue=? AND phase=? AND generation=?", (aid, repo, issue, phase, generation)).fetchone()
+            existing = con.execute("SELECT status,task_id FROM actions WHERE action_id=? AND repo=? AND issue=? AND phase=? AND owner=? AND generation=?", (aid, repo, issue, phase, owner, generation)).fetchone()
             if not existing or existing["status"] not in ("acknowledged", "effect_verified") or existing["task_id"] != task_id:
                 raise ValueError("acknowledgment compare-and-set failed")
         else:
@@ -364,7 +364,7 @@ def dispatch(con, db_path, repo, issue, phase, owner, generation, verb, adapter,
             task_id = valid_id(answer["task_id"], "task ID")
         except (KeyError, TypeError, json.JSONDecodeError):
             raise ValueError(f"adapter returned no valid task_id; reservation {row['action_id']} remains for reconciliation")
-        acknowledge(con, repo, issue, phase, generation, row["action_id"], task_id)
+        acknowledge(con, repo, issue, phase, owner, generation, row["action_id"], task_id)
         return {"action_id": row["action_id"], "task_id": task_id, "status": "acknowledged"}
 
 
@@ -379,7 +379,7 @@ def main():
         p = sub.choices[name]
         p.add_argument("--issue", type=int, required=True)
         p.add_argument("--phase", required=True)
-    for name in ("claim", "release", "reserve", "dispatch", "abandon"):
+    for name in ("claim", "release", "reserve", "dispatch", "ack", "abandon"):
         sub.choices[name].add_argument("--owner", required=True)
     sub.choices["release"].add_argument("--generation", type=int, required=True)
     sub.choices["reserve"].add_argument("--generation", type=int, required=True)
@@ -435,7 +435,8 @@ def main():
         elif args.command == "ack":
             if args.generation <= 0:
                 raise ValueError("generation must be positive")
-            acknowledge(con, repo, args.issue, args.phase, args.generation, args.action_id, args.task_id)
+            valid_id(args.owner, "owner")
+            acknowledge(con, repo, args.issue, args.phase, args.owner, args.generation, args.action_id, args.task_id)
             result = {"acknowledged": True, "action_id": args.action_id}
         elif args.command == "abandon":
             if args.generation <= 0:

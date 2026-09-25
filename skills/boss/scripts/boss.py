@@ -386,12 +386,20 @@ def main():
                     tickets[key]["prs"].append(pr)
                     save(path, state)
             elif args.action == "confirm":
-                if key not in tickets or tickets[key]["status"] not in ("ready", "launching") or tickets[key].get("action_id") not in (None, args.action_id):
+                if key not in tickets:
                     fail("launch confirmation precondition failed")
                 task_id = identifier(args.task_id, "task ID")
-                operational_store(repo, "ack", "--issue", str(number), "--phase", args.phase, "--generation", str(args.generation), "--action-id", args.action_id, "--task-id", task_id)
-                tickets[key].update(status="launched", action_id=args.action_id, task_id=task_id, launched_at=iso(now()))
-                save(path, state)
+                ticket = tickets[key]
+                if ticket["status"] == "launched":
+                    if ticket.get("action_id") != args.action_id or ticket.get("task_id") != task_id:
+                        fail("launch confirmation precondition failed")
+                    operational_store(repo, "ack", "--issue", str(number), "--phase", args.phase, "--owner", args.owner, "--generation", str(args.generation), "--action-id", args.action_id, "--task-id", task_id)
+                elif ticket["status"] in ("ready", "launching") and ticket.get("action_id") in (None, args.action_id):
+                    operational_store(repo, "ack", "--issue", str(number), "--phase", args.phase, "--owner", args.owner, "--generation", str(args.generation), "--action-id", args.action_id, "--task-id", task_id)
+                    ticket.update(status="launched", action_id=args.action_id, task_id=task_id, launched_at=iso(now()))
+                    save(path, state)
+                else:
+                    fail("launch confirmation precondition failed")
             elif args.action == "abandon":
                 if key not in tickets or (tickets[key]["status"] == "launching" and tickets[key].get("action_id") != args.action_id) or tickets[key]["status"] not in ("ready", "launching"):
                     fail("launch abandonment precondition failed")
@@ -400,6 +408,7 @@ def main():
                     fail("abandonment evidence must be 10-500 characters")
                 operational_store(repo, "abandon", "--issue", str(number), "--phase", args.phase, "--owner", args.owner, "--generation", str(args.generation), "--action-id", args.action_id, "--inventory", args.inventory, "--evidence", evidence)
                 tickets[key].update(status="ready", launch_abandoned_at=iso(now()), launch_abandonment=evidence)
+                tickets[key].pop("action_id", None)
                 save(path, state)
             else:
                 launch_eligibility(state, number)

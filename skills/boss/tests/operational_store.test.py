@@ -165,10 +165,12 @@ class OperationalStoreTests(unittest.TestCase):
     def test_ack_is_cas_fenced_and_next_scan_verifies_effect(self):
         claim = self.claim()
         reserved = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
-        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "task-14"))
+        for owner, expected in (("worker-B", 2), ("worker-A", 0)):
+            with self.subTest(owner=owner, expected=expected):
+                self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--owner", owner, "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "task-14"), expected=expected)
         # Retrying the same CAS result is idempotent; conflicting task IDs are rejected.
-        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "task-14"))
-        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "other-task"), expected=2)
+        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "task-14"))
+        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "other-task"), expected=2)
         absent = self.call(*self.command("scan", "--inventory", self.inventory([])))
         self.assertEqual(absent["actions"][0]["status"], "action_effect_missing")
         present = self.call(*self.command("scan", "--inventory", self.inventory([{"id": "task-14", "action_id": reserved["action_id"], "status": "running"}], "present.json")))
@@ -176,7 +178,7 @@ class OperationalStoreTests(unittest.TestCase):
         self.call(*self.command("release", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"])))
         next_claim = self.claim("worker-B")
         self.assertEqual(next_claim["generation"], 2)
-        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--generation", "1", "--action-id", "0" * 64, "--task-id", "stale-task"), expected=2)
+        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", "1", "--action-id", "0" * 64, "--task-id", "stale-task"), expected=2)
 
     def test_bad_inventory_and_injection_like_inputs_are_rejected(self):
         claim = self.claim()
@@ -211,7 +213,7 @@ class OperationalStoreTests(unittest.TestCase):
     def test_rebuild_replays_append_only_history_then_verifies_live_inventory(self):
         claim = self.claim()
         action = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
-        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--task-id", "task-14"))
+        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--task-id", "task-14"))
         inventory = self.inventory([{"id": "task-14", "action_id": action["action_id"], "status": "running"}])
         con = sqlite3.connect(self.db)
         con.execute("DELETE FROM actions")
