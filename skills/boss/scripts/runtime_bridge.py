@@ -248,7 +248,7 @@ def main(argv=None) -> int:
     ap.add_argument("--prs-file", type=Path, help="offline fixture only")
     ap.add_argument("--processes-file", type=Path, help="offline fixture only")
     ap.add_argument("--skip-audit", action="store_true", help="offline fixture only")
-    ap.add_argument("--dry-run", action="store_true", help="no writes, no audit")
+    ap.add_argument("--dry-run", action="store_true", help="no persistent writes or audit; inventory uses a temporary catalog snapshot")
     args = ap.parse_args(argv)
     if args.hub_task and not UUID.fullmatch(args.hub_task):
         raise BridgeError("invalid monitoring hub task ID")
