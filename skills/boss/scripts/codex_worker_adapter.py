@@ -118,6 +118,10 @@ class AppServer:
                 self.proc.wait(timeout=2)
             except (OSError, subprocess.TimeoutExpired):
                 self.proc.kill()
+        finally:
+            for stream in (self.proc.stdout, self.proc.stderr):
+                if stream:
+                    stream.close()
 
     def __enter__(self):
         return self
@@ -285,6 +289,16 @@ def prepare_worktree(source, issue, action_id):
 
 
 def check_live_writer(task_id):
+    lock_path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "thread-writer-locks" / f"{task_id}.lock"
+    if lock_path.exists():
+        try:
+            with lock_path.open("rb") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except BlockingIOError:
+            return f"Codex thread writer lock held for {task_id}"
+        except OSError as exc:
+            raise AdapterError("could not verify Codex thread writer lock; refusing resume or takeover") from exc
     try:
         output = run(["ps", "-axo", "pid=,command="], timeout=5)
     except AdapterError:

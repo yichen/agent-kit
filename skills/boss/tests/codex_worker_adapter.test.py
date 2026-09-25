@@ -5,8 +5,11 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -59,6 +62,56 @@ class FakeServer:
             next(row for row in self.rows if row["id"] == params["threadId"])["name"] = params["name"]
             return {}
         raise AssertionError(f"unexpected mutating RPC {method}")
+
+
+class FakeRpcProcess:
+    def __init__(self, mode="normal", **_kwargs):
+        self.mode = mode
+        request_read, request_write = os.pipe()
+        response_read, response_write = os.pipe()
+        self.stdin = os.fdopen(request_write, "w", buffering=1)
+        self.stdout = os.fdopen(response_read, "rb", buffering=0)
+        self.stderr = io.StringIO()
+        self.exit_code = None
+        self.thread = threading.Thread(target=self.serve, args=(request_read, response_write), daemon=True)
+        self.thread.start()
+
+    def serve(self, request_fd, response_fd):
+        code = 0
+        try:
+            with os.fdopen(request_fd, "rb", buffering=0) as incoming, os.fdopen(response_fd, "wb", buffering=0) as outgoing:
+                for line in incoming:
+                    request = json.loads(line)
+                    if request.get("method") == "initialize":
+                        outgoing.write(b'{"method":"thread/started","params":{}}\n')
+                    elif "id" not in request:
+                        continue
+                    elif self.mode == "timeout":
+                        continue
+                    elif self.mode == "disconnect":
+                        code = 1
+                        return
+                    response = {"id": request["id"], "result": {"data": []}}
+                    outgoing.write(json.dumps(response).encode() + b"\n")
+        except (BrokenPipeError, OSError, json.JSONDecodeError):
+            code = 1
+        finally:
+            self.exit_code = code
+
+    def poll(self):
+        return self.exit_code
+
+    def wait(self, timeout=None):
+        self.thread.join(timeout)
+        if self.thread.is_alive():
+            raise subprocess.TimeoutExpired("fake-codex-proxy", timeout)
+        return self.exit_code or 0
+
+    def terminate(self):
+        self.exit_code = 1
+
+    def kill(self):
+        self.exit_code = 1
 
 
 def row(task_id=TASK, action_id=ACTION, turn_status="interrupted", **overrides):
@@ -130,6 +183,40 @@ class CodexWorkerAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(adapter.AdapterError, "live Codex writer"):
                 adapter.resume(server, {"action_id": ACTION, "task_id": TASK, "prompt": "continue"})
         self.assertFalse(any(method in ("thread/resume", "turn/start") for method, _ in server.calls))
+
+    def test_live_writer_lock_is_detected_even_when_process_argv_has_no_task_uuid(self):
+        codex_home = self.root / "codex-home"
+        lock_dir = codex_home / "thread-writer-locks"
+        lock_dir.mkdir(parents=True)
+        lock_path = lock_dir / f"{TASK}.lock"
+        lock_path.touch()
+        code = "import fcntl,sys,time; f=open(sys.argv[1],'rb'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); time.sleep(10)"
+        writer = subprocess.Popen([sys.executable, "-c", code, str(lock_path)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(writer.stdout.readline().strip(), "ready")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
+                 mock.patch.object(adapter, "run", return_value=""):
+                self.assertIn("writer lock held", adapter.check_live_writer(TASK))
+        finally:
+            writer.terminate()
+            writer.wait(timeout=5)
+            writer.stdout.close()
+
+    def test_app_server_framing_ignores_notifications_before_response(self):
+        def factory(*_args, **kwargs):
+            return FakeRpcProcess("normal", **kwargs)
+        with mock.patch.object(adapter.shutil, "which", return_value="/codex"), adapter.AppServer(process_factory=factory) as server:
+            response = server.call("thread/list", {"useStateDbOnly": True})
+            self.assertEqual(response, {"data": []})
+
+    def test_app_server_timeout_and_connection_loss_fail_closed(self):
+        for mode, message in (("timeout", "timed out"), ("disconnect", "connection closed")):
+            with self.subTest(mode=mode):
+                def factory(*_args, **kwargs):
+                    return FakeRpcProcess(mode, **kwargs)
+                with mock.patch.object(adapter.shutil, "which", return_value="/codex"), adapter.AppServer(timeout=0.05, process_factory=factory) as server:
+                    with self.assertRaisesRegex(adapter.AdapterError, message):
+                        server.call("thread/list", {"useStateDbOnly": True})
 
     def test_resume_uses_exact_matching_task_after_live_state_check(self):
         other = row(TASK2, "b" * 64, turn_status="interrupted")
