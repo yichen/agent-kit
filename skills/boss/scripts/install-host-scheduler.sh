@@ -23,6 +23,19 @@ case "$MODE" in
   *) echo "usage: $0 check|install|stop" >&2; exit 1 ;;
 esac
 
+safe_absolute_path() {
+  local candidate="$1"
+  [[ "$candidate" = /* ]] || return 1
+  case "$candidate" in *[!A-Za-z0-9_./-]*) return 1 ;; esac
+  case "/$candidate/" in */../*|*//../*|*///../*) return 1 ;; esac
+  return 0
+}
+
+if ! safe_absolute_path "$USER_HOME" || ! safe_absolute_path "$SKILL_PATH"; then
+  echo "boss scheduler: home and skill paths must be absolute and contain only letters, digits, slash, dot, underscore, or hyphen" >&2
+  exit 2
+fi
+
 if [ "$MODE" != "stop" ] && { [ ! -x "$SKILL_PATH/scripts/scheduler.py" ] || [ ! -x "$SKILL_PATH/scripts/watchdog.py" ]; }; then
   echo "boss scheduler: installed skill scripts are missing at $SKILL_PATH" >&2
   exit 2
@@ -78,6 +91,7 @@ cat >"$SCHEDULER_PLIST" <<EOF
     <string>--repo</string><string>$USER_HOME/work/agent-kit</string>
     <string>--operations-db</string><string>$STATE_DIR/operations.sqlite3</string>
     <string>--last-success</string><string>$LAST_SUCCESS</string>
+    <string>--write-last-success</string>
   </array>
   <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><true/>

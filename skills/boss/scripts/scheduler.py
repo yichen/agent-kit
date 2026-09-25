@@ -3,8 +3,9 @@
 
 The scheduler inventories only the configured agent-kit repository, its local
 /boss ledger and claims, GitHub, and live Codex task state. It never creates or
-resumes tasks, acquires claims, changes GitHub, or edits source ledgers. Its sole
-write is an atomic last-success receipt used by the independent watchdog.
+resumes tasks, acquires claims, changes GitHub, or edits source ledgers. It is
+no-write by default; an explicit flag opts into writing only the last-success
+receipt used by the independent watchdog.
 """
 from __future__ import annotations
 
@@ -88,8 +89,8 @@ def read_boss_state(path: Path, repo: str, now: datetime) -> dict:
     if not isinstance(monitor, dict) or not monitor.get("name") or not monitor.get("last_scan_at"):
         raise SchedulerError("agent-kit /boss ledger has no prior scan")
     age = now - timestamp(monitor["last_scan_at"])
-    if age < -timedelta(minutes=2) or age > MAX_AGE:
-        raise SchedulerError("stale agent-kit /boss ledger; refresh before comparison")
+    if age < -timedelta(minutes=2):
+        raise SchedulerError("agent-kit /boss scan timestamp is in the future")
     tickets = data.get("tickets")
     if not isinstance(tickets, dict):
         raise SchedulerError("agent-kit /boss ticket ledger is malformed")
@@ -113,21 +114,43 @@ def gh_inventory(repo: str, *, runner=subprocess.run) -> tuple[list[dict], list[
     return issues, prs
 
 
-def live_tasks(task_ids: set[str], *, server_factory=AppServer) -> dict[str, str]:
+def live_tasks(task_ids: set[str], repo_path: Path, *, server_factory=AppServer) -> dict:
     if any(not isinstance(task_id, str) or not TASK_ID.fullmatch(task_id) for task_id in task_ids):
         raise SchedulerError("agent-kit ledger contains an invalid task ID")
-    if not task_ids:
-        return {}
     try:
         with server_factory() as server:
-            summaries = {item.get("id"): item for item in server.threads() if isinstance(item, dict)}
-            result = {}
+            summaries = {}
+            for item in server.threads():
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                    raise SchedulerError("live Codex inventory contains a malformed thread")
+                if item["id"] in summaries:
+                    raise SchedulerError("live Codex inventory contains a duplicate thread ID")
+                summaries[item["id"]] = item
+            result, relevant = {}, []
+            issue_name = re.compile(r"^agent-kit\s+#([1-9][0-9]*)(?:\s|:)", re.I)
+            issue_cwd = re.compile(r"^agent-kit-issue-([1-9][0-9]*)-[a-f0-9]{8}$")
             for task_id in sorted(task_ids):
                 if task_id not in summaries:
                     result[task_id] = "unknown"
+            for task_id, summary in summaries.items():
+                marker = summary.get("threadSource")
+                marker_id = marker.removeprefix("agent-kit:launch:") if isinstance(marker, str) and marker.startswith("agent-kit:launch:") else None
+                name = summary.get("name")
+                name_match = issue_name.search(name) if isinstance(name, str) else None
+                cwd = summary.get("cwd")
+                cwd_path = Path(cwd) if isinstance(cwd, str) and cwd else None
+                cwd_match = issue_cwd.fullmatch(cwd_path.name) if cwd_path else None
+                checkout_match = bool(cwd_path and (cwd_path == repo_path.resolve()
+                                                     or cwd_path.name.startswith("agent-kit-issue-")))
+                if task_id not in task_ids and not marker_id and not name_match and not cwd_match and not checkout_match:
                     continue
-                result[task_id] = task_status(server.read(task_id))
-            return result
+                thread = server.read(task_id)
+                status = task_status(thread)
+                result[task_id] = status
+                relevant.append({"id": task_id, "status": status, "action_id": marker_id,
+                                 "issue": int(name_match.group(1)) if name_match else int(cwd_match.group(1)) if cwd_match else None,
+                                 "cwd": cwd or thread.get("cwd")})
+            return {"by_id": result, "relevant": relevant, "all_live_threads": len(summaries)}
     except Exception as exc:
         raise SchedulerError(f"live Codex inventory unavailable: {str(exc)[:500]}") from exc
 
@@ -140,8 +163,17 @@ def read_claims(db_path: Path, repo: str) -> list[dict]:
         connection = sqlite3.connect(uri, uri=True, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
-        rows = connection.execute("SELECT repo,issue,phase,generation,owner,status,acquired_at "
-                                  "FROM claims WHERE repo=? AND status='active' ORDER BY issue,phase", (repo.lower(),)).fetchall()
+        rows = connection.execute("""
+            SELECT c.repo,c.issue,c.phase,c.generation,c.owner,c.status,c.acquired_at,
+                   COALESCE(GROUP_CONCAT(DISTINCT a.action_id),'') AS action_ids,
+                   COALESCE(GROUP_CONCAT(DISTINCT a.task_id),'') AS task_ids
+              FROM claims c LEFT JOIN actions a
+                ON a.repo=c.repo AND a.issue=c.issue AND a.phase=c.phase
+               AND a.generation=c.generation AND a.owner=c.owner
+             WHERE c.repo=? AND c.status='active'
+             GROUP BY c.repo,c.issue,c.phase,c.generation,c.owner,c.status,c.acquired_at
+             ORDER BY c.issue,c.phase
+        """, (repo.lower(),)).fetchall()
         return [dict(row) for row in rows]
     except sqlite3.Error as exc:
         raise SchedulerError(f"operational claim inventory unavailable: {exc}") from exc
@@ -150,7 +182,8 @@ def read_claims(db_path: Path, repo: str) -> list[dict]:
             connection.close()
 
 
-def compare(state: dict, issues: list[dict], prs: list[dict], tasks: dict[str, str], claims: list[dict], now: datetime) -> dict:
+def compare(state: dict, issues: list[dict], prs: list[dict], tasks: dict, claims: list[dict], now: datetime) -> dict:
+    task_map = tasks.get("by_id", tasks)
     issue_map = {row.get("number"): row for row in issues if isinstance(row, dict)}
     pr_map = {row.get("number"): row for row in prs if isinstance(row, dict)}
     if len(issue_map) != len(issues) or len(pr_map) != len(prs):
@@ -178,19 +211,59 @@ def compare(state: dict, issues: list[dict], prs: list[dict], tasks: dict[str, s
         task_id = ticket.get("task_id")
         if task_id:
             known_tasks.add(task_id)
-            task_state = tasks.get(task_id, "unknown")
+            task_state = task_map.get(task_id, "unknown")
             if task_state == "unknown":
                 disputes.append({"kind": "task_missing", "issue": number, "task_id": task_id})
             if ticket.get("status") == "launched" and task_state in ("completed", "interrupted"):
                 disputes.append({"kind": "task_terminal", "issue": number, "task_id": task_id, "live": task_state})
         active = active_claims.get(number, [])
-        if ticket.get("status") == "launched" and len(active) != 1:
+        if ticket.get("status") in ("launching", "launched") and len(active) != 1:
             disputes.append({"kind": "claim_count", "issue": number, "expected": 1, "actual": len(active)})
+        if ticket.get("status") in ("ready", "resolved") and active:
+            disputes.append({"kind": "unexpected_active_claim", "issue": number, "ticket_status": ticket.get("status")})
         if len(active) > 1:
             disputes.append({"kind": "multiple_active_claims", "issue": number,
                              "phases": [item["phase"] for item in active]})
+        for claim in active:
+            if ticket.get("task_id") and ticket["task_id"] not in (claim.get("task_ids") or "").split(","):
+                disputes.append({"kind": "claim_task_mismatch", "issue": number,
+                                 "claim_generation": claim["generation"], "task_id": ticket["task_id"]})
+            if ticket.get("action_id") and ticket["action_id"] not in (claim.get("action_ids") or "").split(","):
+                disputes.append({"kind": "claim_action_mismatch", "issue": number,
+                                 "claim_generation": claim["generation"], "action_id": ticket["action_id"]})
+    for issue, active in active_claims.items():
+        if str(issue) not in state["tickets"]:
+            disputes.append({"kind": "untracked_active_claim", "issue": issue,
+                             "phases": [row["phase"] for row in active]})
+    ticket_by_issue = {ticket.get("issue"): ticket for ticket in state["tickets"].values()}
+    task_owners = {ticket.get("task_id"): ticket.get("issue") for ticket in state["tickets"].values()
+                   if ticket.get("task_id")}
+    action_owners = {ticket.get("action_id"): ticket.get("issue") for ticket in state["tickets"].values()
+                     if ticket.get("action_id")}
+    for row in tasks.get("relevant", []):
+        if row.get("status") not in {"queued", "running", "blocked", "interrupted"}:
+            continue
+        issue = row.get("issue") or action_owners.get(row.get("action_id")) or task_owners.get(row["id"])
+        ticket = ticket_by_issue.get(issue)
+        if ticket is None:
+            disputes.append({"kind": "unmatched_live_task", "task_id": row["id"], "issue": issue,
+                             "status": row["status"]})
+        elif ticket.get("task_id") != row["id"]:
+            disputes.append({"kind": "duplicate_live_task", "issue": issue,
+                             "expected_task_id": ticket.get("task_id"), "task_id": row["id"],
+                             "status": row["status"]})
+        elif row.get("action_id") and ticket.get("action_id") and row["action_id"] != ticket["action_id"]:
+            disputes.append({"kind": "live_task_action_mismatch", "issue": issue,
+                             "task_id": row["id"], "action_id": row["action_id"]})
     all_prs = [row for row in prs if row.get("state") == "OPEN"]
-    tracked_prs = {pr for ticket in state["tickets"].values() for pr in ticket.get("prs", [])}
+    pr_owners = {}
+    for ticket in state["tickets"].values():
+        for pr_number in ticket.get("prs", []):
+            pr_owners.setdefault(pr_number, []).append(ticket.get("issue"))
+    for pr_number, owners in pr_owners.items():
+        if len(owners) > 1:
+            disputes.append({"kind": "multiple_pr_owners", "pr": pr_number, "issues": owners})
+    tracked_prs = set(pr_owners)
     for pr in all_prs:
         if pr.get("number") not in tracked_prs:
             disputes.append({"kind": "untracked_open_pr", "pr": pr.get("number"), "head": pr.get("headRefOid")})
@@ -204,10 +277,14 @@ def compare(state: dict, issues: list[dict], prs: list[dict], tasks: dict[str, s
     return {"as_of": now.isoformat().replace("+00:00", "Z"), "repository": "yichen/agent-kit",
             "mode": "shadow", "assignment_enabled": False, "pi_dispatch_enabled": False,
             "pi_dispatch": "disabled; issue #20 remains gated and unlaunched",
+            "live_task_scope": "all app-server summaries counted; task details read for ledger IDs and agent-kit action/name/worktree matches; active unmatched matches are disputes",
+            "ledger_scan_age_minutes": max(0, round((now - timestamp(state["monitor"]["last_scan_at"])).total_seconds() / 60, 1)),
+            "ledger_scan_stale": now - timestamp(state["monitor"]["last_scan_at"]) > MAX_AGE,
             "inventory": {"issues": len(issues), "open_issues": sum(row.get("state") == "OPEN" for row in issues),
                           "pull_requests": len(prs), "open_pull_requests": len(all_prs),
                           "tickets": len(state["tickets"]), "ledger_task_ids": len(known_tasks),
-                          "live_task_observations": len(tasks), "active_claims": len(claims),
+                          "live_task_observations": len(task_map), "agent_kit_live_tasks": len(tasks.get("relevant", [])),
+                          "all_live_threads": tasks.get("all_live_threads", len(task_map)), "active_claims": len(claims),
                           "remaining_claim_capacity": max(0, 1 - len(claims))},
             "pilot_candidates": pilot_candidates,
             "pilot_blocker": None if pilot_candidates else "no dependency-ready tracked issue is available for low-risk pilot selection",
@@ -235,6 +312,8 @@ def main(argv=None) -> int:
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--operations-db", type=Path, default=Path.home() / "agents-artifacts/boss/operations.sqlite3")
     parser.add_argument("--last-success", type=Path, required=True)
+    parser.add_argument("--write-last-success", action="store_true",
+                        help="explicitly persist the successful comparison receipt for the independent watchdog")
     args = parser.parse_args(argv)
     now = datetime.now(UTC)
     try:
@@ -242,10 +321,11 @@ def main(argv=None) -> int:
         state = read_boss_state(boss_state_path(repo), repo, now)
         issues, prs = gh_inventory(repo)
         task_ids = {ticket.get("task_id") for ticket in state["tickets"].values() if ticket.get("task_id")}
-        tasks = live_tasks(task_ids)
+        tasks = live_tasks(task_ids, args.repo.resolve())
         claims = read_claims(args.operations_db, repo)
         result = compare(state, issues, prs, tasks, claims, now)
-        atomic_receipt(args.last_success, result)
+        if args.write_last_success:
+            atomic_receipt(args.last_success, result)
         print(json.dumps(result, sort_keys=True))
         return 0 if not result["disputed"] else 3
     except (SchedulerError, OSError, sqlite3.Error, subprocess.TimeoutExpired) as exc:

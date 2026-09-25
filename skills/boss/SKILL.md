@@ -196,16 +196,23 @@ a supported remote inventory adapter exists.
 
 `scripts/scheduler.py` compares the `yichen/agent-kit` `/boss` JSON ledger and
 SQLite claims with GitHub issue/PR state and the live Codex task API. It is
-read-only except for its own atomic last-success receipt. It never launches,
+read-only by default: it never writes the last-success receipt unless
+`--write-last-success` is explicitly set by the LaunchAgent. It never launches,
 resumes, claims, merges, or edits issues. Missing app-server access, stale `/boss`
 scan time, or GitHub errors fail closed and do not refresh the receipt. A
 completed comparison with ownership disputes exits 3 and records the disputes;
 the watchdog treats those receipts as unhealthy.
+It records the full app-server thread count and reads details for every ledger
+task plus tasks marked by the agent-kit action ID, issue name, or worktree
+pattern; active unmatched or duplicate agent-kit tasks are disputes. The older
+`/boss` scan timestamp is reported for context but is not a recurring-scheduler
+heartbeat, so scheduled comparisons do not depend on a separate manual scan.
 
 After this code is merged and installed, run
 `scripts/install-host-scheduler.sh install` to load one 900-second shadow job
-and one separate 60-second watchdog. The scheduler writes only to the
-`agent-kit` log and last-success paths under `~/agents-artifacts/boss/`. The
+and one separate 60-second watchdog. The LaunchAgent opts into writing only
+its last-success receipt; every other comparison input remains read-only. Logs
+and the receipt live under `~/agents-artifacts/boss/`. The
 watchdog checks freshness and reports errors in its own launchd stderr log;
 freshness does not mean assignment is healthy. `scripts/install-host-scheduler.sh
 stop` unloads these two read-only services and never starts another launcher,
