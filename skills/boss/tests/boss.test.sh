@@ -156,6 +156,7 @@ run ticket launch --repo "$REPO" --issue 4 --adapter "$ADAPTER" --apply --phase 
 run ticket add --repo "$REPO" --issue 5 --kind feature > /dev/null
 GEN5="$(ops claim --issue 5 --phase implement --owner boss-A | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
 ACTION5="$(ops reserve --issue 5 --phase implement --owner boss-A --generation "$GEN5" --verb launch | python3 -c 'import json,sys;print(json.load(sys.stdin)["action"]["action_id"])')"
+ops start --issue 5 --phase implement --owner boss-A --generation "$GEN5" --action-id "$ACTION5" > /dev/null
 ops ack --issue 5 --phase implement --owner boss-A --generation "$GEN5" --action-id "$ACTION5" --task-id task-2 > /dev/null
 expect_fail 'compare-and-set failed' ticket confirm --repo "$REPO" --issue 5 --action-id wrong --task-id task-2 --phase implement --owner boss-A --generation "$GEN5"
 expect_fail 'stale generation or owner' ticket confirm --repo "$REPO" --issue 5 --action-id "$ACTION5" --task-id task-2 --phase implement --owner boss-B --generation "$GEN5"

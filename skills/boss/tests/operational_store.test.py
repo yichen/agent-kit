@@ -165,6 +165,7 @@ class OperationalStoreTests(unittest.TestCase):
     def test_ack_is_cas_fenced_and_next_scan_verifies_effect(self):
         claim = self.claim()
         reserved = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
+        self.call(*self.command("start", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"]))
         for owner, expected in (("worker-B", 2), ("worker-A", 0)):
             with self.subTest(owner=owner, expected=expected):
                 self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--owner", owner, "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "task-14"), expected=expected)
@@ -213,6 +214,7 @@ class OperationalStoreTests(unittest.TestCase):
     def test_rebuild_replays_append_only_history_then_verifies_live_inventory(self):
         claim = self.claim()
         action = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
+        self.call(*self.command("start", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"]))
         self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--task-id", "task-14"))
         inventory = self.inventory([{"id": "task-14", "action_id": action["action_id"], "status": "running"}])
         con = sqlite3.connect(self.db)
@@ -225,6 +227,20 @@ class OperationalStoreTests(unittest.TestCase):
         status = self.call(*self.command("status"))
         self.assertEqual(status["active_claims"][0]["owner"], "worker-A")
         self.assertEqual(status["actions"][0]["status"], "effect_verified")
+
+    def test_host_task_dispatch_cannot_be_abandoned_until_call_finishes(self):
+        claim = self.claim()
+        action = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
+        self.call(*self.command("start", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"]))
+        inventory = self.inventory([])
+        abandon_args = self.command("abandon", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--inventory", inventory, "--evidence", "Fresh inventory is empty while host task call is in flight")
+        self.call(*abandon_args, expected=2)
+        self.call(*self.command("release", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"])), expected=2)
+        self.call(*self.command("finish", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--evidence", "Host task tool returned without creating a task"))
+        inventory = self.inventory([])
+        self.call(*self.command("abandon", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--inventory", inventory, "--evidence", "Fresh inventory after completed host call is empty"))
+        next_action = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
+        self.assertNotEqual(next_action["action_id"], action["action_id"])
 
 
 if __name__ == "__main__":
