@@ -93,6 +93,10 @@ def inventory(ledger: dict, db: Path, processes: str, now: datetime) -> dict:
 
 def discover_open_prs(ledger: dict, prs: list[dict]) -> list[tuple[str, int]]:
     """Only explicit closing syntax can link a PR; weaker hints demand review."""
+    for row in ledger["objectives"]:
+        linked = row.get("pull_requests", [])
+        if not isinstance(linked, list) or any(type(number) is not int or number < 1 for number in linked):
+            raise BridgeError(f"{row.get('id')}: malformed linked PR numbers")
     rows = {row.get("issue_number"): row for row in ledger["objectives"]
             if type(row.get("issue_number")) is int and row.get("work_item")}
     additions = []

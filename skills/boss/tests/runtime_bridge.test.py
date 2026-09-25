@@ -75,6 +75,23 @@ class RuntimeBridgeTests(unittest.TestCase):
                 else:
                     self.assertEqual(bridge.discover_open_prs(ledger, prs), expected)
 
+    def test_malformed_linked_pr_numbers_fail_before_attachment(self):
+        cases = [
+            [{"number": 615, "state": "OPEN"}],
+            ["615"],
+            [True],
+            [0],
+            -1,
+        ]
+        for linked in cases:
+            with self.subTest(linked=linked):
+                ledger = {"objectives": [objective(604, pull_requests=linked)]}
+                prs = [{"number": 615, "state": "OPEN", "body": "Closes #604",
+                        "title": "Fix #604", "headRefName": "codex/604-fix"}]
+                with self.assertRaisesRegex(bridge.BridgeError, "malformed linked PR numbers"):
+                    bridge.discover_open_prs(ledger, prs)
+                self.assertEqual(ledger["objectives"][0]["pull_requests"], linked)
+
     def test_missing_catalog_and_partial_rollout_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
