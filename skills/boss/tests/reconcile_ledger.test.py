@@ -148,9 +148,13 @@ class ReconcileTests(unittest.TestCase):
             mod.acknowledge(outbox, action["id"], "Task launch accepted: task UUID 123", NOW + timedelta(minutes=16))
             self.assertEqual(mod.sync_outbox(outbox, [action], NOW + timedelta(minutes=17)), [])
             self.assertEqual(mod.sync_outbox(outbox, [action], NOW + timedelta(minutes=32)), [action["id"]])
-            mod.sync_outbox(outbox, [], NOW + timedelta(minutes=33))
+            first_ack = json.loads(outbox.read_text())["actions"][action["id"]]["acknowledged_at"]
+            mod.acknowledge(outbox, action["id"], "Task launch accepted: task UUID 123", NOW + timedelta(minutes=32))
+            self.assertEqual(json.loads(outbox.read_text())["actions"][action["id"]]["acknowledged_at"], first_ack)
+            self.assertEqual(mod.sync_outbox(outbox, [action], NOW + timedelta(minutes=33)), [action["id"]])
+            mod.sync_outbox(outbox, [], NOW + timedelta(minutes=34))
             self.assertEqual(json.loads(outbox.read_text())["actions"][action["id"]]["state"], "resolved")
-            self.assertEqual(mod.sync_outbox(outbox, [action], NOW + timedelta(minutes=34)), [])
+            self.assertEqual(mod.sync_outbox(outbox, [action], NOW + timedelta(minutes=35)), [])
             self.assertEqual(json.loads(outbox.read_text())["actions"][action["id"]]["state"], "pending")
             for bad in ("bad", "a" * 24):
                 with self.assertRaises(mod.ReconcileError):
