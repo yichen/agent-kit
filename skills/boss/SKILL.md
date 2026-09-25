@@ -54,7 +54,7 @@ completion.
 Each action has a stable `id`, exact repository/objective/issue, task and PR
 identifiers where known, exact current PR head where applicable, and a verb:
 `LAUNCH_TASK`, `RESUME_TASK`, `REPAIR_PR`, `RECOVER_OWNER`,
-`RECONCILE_ISSUE`, or `VERIFY_MERGE`.
+`RECONCILE_ISSUE`, `VERIFY_MERGE`, or `QUARANTINE_PR`.
 The host worker may execute only that verb with its existing task tools and
 authorization checks. After the tool succeeds, run `ack --outbox <absolute-path>
 --id <id> --evidence '<task ID or other concrete result>'`. Acknowledgment is
@@ -63,6 +63,15 @@ next scan verifies the action disappeared from live state; acknowledgment
 alone never completes the ticket. `RECONCILE_ISSUE` means code is already
 merged and the worker must inspect issue acceptance, rollout, and human gates;
 it must not start another coding task merely because the issue is open.
+The reconciler processes the complete `open_pull_requests` inventory before
+issue completion, dispatch holds, dependencies, or human gates. Untracked or
+ambiguous PRs produce `QUARANTINE_PR`; candidate tracked objectives wait until
+ownership is resolved, preventing a duplicate launch. A linked PR needs its
+exact head SHA, mergeability, exact `required_checks` names, and one check
+observation per name for that same head. Partial pass counts never authorize
+`VERIFY_MERGE`. A missing or duplicated required context requests owner
+recovery, a failed, stale (over 45 minute), or wrong-head context requests PR
+repair, and pending checks wait only while their start time is fresh.
 `VERIFY_MERGE` is an inspection task, **not merge authorization**: the worker
 must independently verify every required CI context on the exact current PR
 head, current-head independent review, repository merge rules, and human gates
@@ -79,9 +88,11 @@ deduplicates by action ID, records the real task ID, and acknowledges it.
 ### Host runtime bridge
 
 `scripts/runtime_bridge.py` is the 15-minute host entry point for a legacy
-LearnRise ledger. It reads open GitHub PRs, projects only unambiguous `Closes
-#N`/`Fixes #N`/`Resolves #N` links onto an isolated ledger snapshot, audits that
-snapshot, builds a task inventory from the local Codex
+LearnRise ledger. It reads every open GitHub PR, links unambiguous `Closes
+#N`/`Fixes #N`/`Resolves #N` references, and preserves ambiguous or untracked
+PRs as quarantine observations on an isolated ledger snapshot. It reads the
+exact required checks and current head for each PR before auditing that
+snapshot, then builds a task inventory from the local Codex
 catalog and rollout files, checks for live `codex exec resume --json <UUID>`
 writer processes, then invokes `reconcile_ledger.py scan`. A live writer wins
 over an earlier `task_complete`/`interrupted` record. Missing catalog entries,

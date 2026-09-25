@@ -93,20 +93,100 @@ class ReconcileTests(unittest.TestCase):
 
     def test_current_head_controls_repair_and_merge_verification(self):
         task = "01a0d8dc-b312-70d2-ad86-b58088dd22d8"
-        observation = {"head": "a" * 40, "merge": "CLEAN", "check_count": 3,
-                       "passed_count": 3, "failed_checks": [], "pending_checks": []}
+        observation = {"head": "a" * 40, "merge": "CLEAN",
+                       "required_checks": ["Focused tooling", "Unit tests"],
+                       "checks": [
+                           {"name": "Focused tooling", "head": "a" * 40, "state": "SUCCESS"},
+                           {"name": "Unit tests", "head": "a" * 40, "state": "SUCCESS"},
+                       ]}
         item = row("#531", coding_task_id=task, pull_requests=[548], pull_request_states={"548": "OPEN"},
                    pr_observations={"548": observation})
         ledger = {"repository": "example/project", "objectives": [item]}
         tasks = {task: {"id": task, "status": "completed"}}
         self.assertEqual(mod.decide(ledger, tasks)[0][0]["verb"], "VERIFY_MERGE")
         observation["head"] = "b" * 40
-        observation["failed_checks"] = ["Focused tooling"]
+        observation["checks"][0]["state"] = "FAILURE"
         repair = mod.decide(ledger, tasks)[0][0]
         self.assertEqual((repair["verb"], repair["head"]), ("REPAIR_PR", "b" * 40))
         observation["head"] = "not-a-head;touch /tmp/owned"
         with self.assertRaises(mod.ReconcileError):
             mod.decide(ledger, tasks)
+
+    def test_open_pr_prepass_ignores_issue_gates_and_closed_state(self):
+        task = "01a0d8dc-b312-70d2-ad86-b58088dd22d8"
+        head = "a" * 40
+        row_with_pr = row("#531", github_state="CLOSED", human_gate=True,
+                          dispatch_hold={"until": "#999", "reason": "blocked"},
+                          coding_task_id=task, pull_requests=[548], pull_request_states={"548": "OPEN"})
+        obs = {"head": head, "merge": "CLEAN", "required_checks": ["CI"],
+               "checks": [{"name": "CI", "head": head, "state": "FAILURE"}]}
+        row_with_pr["pr_observations"] = {"548": obs}
+        actions, waits = mod.decide({"repository": "example/project", "objectives": [row_with_pr]},
+                                    {task: {"id": task, "status": "running"}})
+        self.assertEqual([(item["verb"], item["pr"], item["head"]) for item in actions],
+                         [("REPAIR_PR", 548, head)])
+        self.assertEqual(waits, [])
+
+    def test_untracked_and_ambiguous_open_prs_are_quarantined_once(self):
+        tracked = row("#531", pull_requests=[548], pull_request_states={"548": "OPEN"})
+        ambiguous = row("#532", pull_requests=[548], pull_request_states={"548": "OPEN"})
+        ledger = {"repository": "example/project", "objectives": [tracked, ambiguous],
+                  "open_pull_requests": [{"number": 548, "head": "a" * 40, "objective": "#531"},
+                                         {"number": 777, "head": "b" * 40}]}
+        actions, _ = mod.decide(ledger, {})
+        self.assertEqual([(a["verb"], a["pr"]) for a in actions],
+                         [("QUARANTINE_PR", 548), ("QUARANTINE_PR", 777)])
+        self.assertEqual(len({a["id"] for a in actions}), len(actions))
+
+    def test_quarantined_candidate_pr_suppresses_duplicate_issue_launch(self):
+        candidate = row("#531")
+        ledger = {"repository": "example/project", "objectives": [candidate],
+                  "open_pull_requests": [{"number": 777, "head": "a" * 40,
+                                          "candidate_objectives": ["#531"],
+                                          "quarantine_reason": "ambiguous issue references"}]}
+        actions, waiting = mod.decide(ledger, {}, NOW)
+        self.assertEqual([(item["verb"], item["pr"]) for item in actions], [("QUARANTINE_PR", 777)])
+        self.assertEqual(waiting, [{"objective": "#531", "reason": "quarantined_pr_candidate"}])
+
+    def test_required_contexts_are_exact_complete_and_current_head(self):
+        task = "01a0d8dc-b312-70d2-ad86-b58088dd22d8"
+        head, other = "a" * 40, "b" * 40
+        base = {"head": head, "merge": "CLEAN", "required_checks": ["Build", "Tests"],
+                "checks": [{"name": "Build", "head": head, "state": "SUCCESS"},
+                          {"name": "Tests", "head": head, "state": "SUCCESS"}]}
+        item = row("#531", coding_task_id=task, pull_requests=[548], pull_request_states={"548": "OPEN"})
+        ledger = {"repository": "example/project", "objectives": [item]}
+        tasks = {task: {"id": task, "status": "running"}}
+        cases = [
+            (base, "VERIFY_MERGE", None),
+            ({**base, "checks": base["checks"][:1]}, "RECOVER_OWNER", None),
+            ({**base, "checks": [*base["checks"], {"name": "Tests", "head": head, "state": "SUCCESS"}]}, "RECOVER_OWNER", None),
+            ({**base, "checks": [base["checks"][0], {"name": "Tests", "head": other, "state": "SUCCESS"}]}, "REPAIR_PR", None),
+            ({**base, "checks": [base["checks"][0], {"name": "Tests", "head": head, "state": "PENDING", "started_at": (NOW - timedelta(minutes=46)).isoformat()}]}, "REPAIR_PR", None),
+            ({**base, "checks": [base["checks"][0], {"name": "Tests", "head": head, "state": "PENDING", "started_at": (NOW - timedelta(minutes=3)).isoformat()}]}, None, "required_pr_checks_pending"),
+        ]
+        for observation, expected_action, expected_wait in cases:
+            with self.subTest(observation=observation):
+                item["pr_observations"] = {"548": observation}
+                actions, waiting = mod.decide(ledger, tasks, NOW)
+                self.assertEqual(actions[0]["verb"] if actions else None, expected_action)
+                self.assertEqual(waiting[0]["reason"] if waiting else None, expected_wait)
+        for required in ([], ["Build", "Build"], ["Build", "$(touch /tmp/owned)"]):
+            with self.subTest(required=required):
+                item["pr_observations"] = {"548": {**base, "required_checks": required}}
+                actions, _ = mod.decide(ledger, tasks, NOW)
+                self.assertEqual(actions[0]["verb"], "RECOVER_OWNER")
+        self.assertFalse(Path("/tmp/owned").exists())
+
+    def test_open_pr_inventory_malformed_inputs_fail_closed(self):
+        cases = [[{"number": True}], [{"number": 548}, {"number": 548}], {"number": 548},
+                 [{"number": "$(touch /tmp/owned)"}]]
+        for inventory in cases:
+            with self.subTest(inventory=inventory):
+                ledger = {"repository": "example/project", "objectives": [], "open_pull_requests": inventory}
+                with self.assertRaises(mod.ReconcileError):
+                    mod.decide(ledger, {}, NOW)
+        self.assertFalse(Path("/tmp/owned").exists())
 
     def test_freshness_and_input_validation(self):
         with tempfile.TemporaryDirectory() as temp:
