@@ -3,6 +3,7 @@ import importlib.util
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+import plistlib
 import sqlite3
 import tempfile
 import unittest
@@ -24,6 +25,16 @@ def objective(number=523, **updates):
 
 
 class RuntimeBridgeTests(unittest.TestCase):
+    def test_sample_scheduler_uses_existing_hub_and_outbox(self):
+        sample = SCRIPT.parents[1] / "examples" / "com.yichen.boss.learnrise.plist"
+        config = plistlib.loads(sample.read_bytes())
+        args = config["ProgramArguments"]
+        self.assertEqual(config["StartInterval"], 900)
+        self.assertEqual(args[args.index("--hub-task") + 1],
+                         "01a0d565-c171-7120-b828-b04db384021f")
+        self.assertEqual(args[args.index("--outbox") + 1],
+                         "/Users/yichen/agents-artifacts/learnrise-orchestrator/boss-action-outbox.json")
+
     def test_live_writer_overrides_completed_or_interrupted_rollout(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

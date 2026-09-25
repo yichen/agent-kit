@@ -106,7 +106,7 @@ python3 "$HOME/.codex/skills/boss/scripts/runtime_bridge.py" \
   --audit "$HOME/agents-artifacts/learnrise-orchestrator/audit.py" \
   --state-db "$HOME/.codex/state_5.sqlite" \
   --tasks "$HOME/agents-artifacts/learnrise-orchestrator/codex-tasks.json" \
-  --outbox "$HOME/agents-artifacts/learnrise-orchestrator/boss-outbox.json" \
+  --outbox "$HOME/agents-artifacts/learnrise-orchestrator/boss-action-outbox.json" \
   --hub-task '<verified-hub-uuid>'
 ```
 

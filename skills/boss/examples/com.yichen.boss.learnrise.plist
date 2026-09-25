@@ -9,7 +9,7 @@
     <string>--audit</string><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/audit.py</string>
     <string>--state-db</string><string>/Users/yichen/.codex/state_5.sqlite</string>
     <string>--tasks</string><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/codex-tasks.json</string>
-    <string>--outbox</string><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/boss-outbox.json</string>
+    <string>--outbox</string><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/boss-action-outbox.json</string>
     <string>--hub-task</string><string>01a0d565-c171-7120-b828-b04db384021f</string>
   </array>
   <key>StartInterval</key><integer>900</integer>
