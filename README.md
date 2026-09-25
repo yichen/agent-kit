@@ -41,6 +41,10 @@ Merge reviewed changes into `main`, then fast-forward this checkout so every hos
 
 ## Skills
 
+### boss
+
+Coordinates one repository's coding tickets and PRs through a single master task. `/boss code` tracks dependencies, dispatches ready work through the host's task tools or a configured idempotent adapter, reports PR health and five-hour throughput, and hands monitoring to a verified host automation and hub task. The helper fails closed when task or monitor integration is unavailable.
+
 ### plan-review
 
 Reviews a plan file before implementation starts.
