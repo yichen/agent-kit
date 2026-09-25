@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -83,6 +84,7 @@ def connect(path, write=False):
           phase TEXT NOT NULL, verb TEXT NOT NULL, attempt INTEGER NOT NULL,
           generation INTEGER NOT NULL,
           owner TEXT NOT NULL, status TEXT NOT NULL, reserved_at TEXT NOT NULL,
+          dispatch_token_hash TEXT,
           task_id TEXT, acknowledged_at TEXT, verified_at TEXT, last_scan_at TEXT,
           last_effect TEXT
         );
@@ -96,6 +98,9 @@ def connect(path, write=False):
         CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
           BEGIN SELECT RAISE(ABORT, 'event history is append-only'); END;
         """)
+        columns = {row[1] for row in con.execute("PRAGMA table_info(actions)")}
+        if "dispatch_token_hash" not in columns:
+            con.execute("ALTER TABLE actions ADD COLUMN dispatch_token_hash TEXT")
     return con
 
 
@@ -191,30 +196,36 @@ def reserve(con, repo, issue, phase, owner, generation, verb):
 
 
 def start_action(con, repo, issue, phase, owner, generation, aid):
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
     begin(con)
     try:
         active = con.execute("SELECT 1 FROM claims WHERE repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='active'", (repo, issue, phase, owner, generation)).fetchone()
         if not active:
             raise ValueError("stale generation or owner: action start rejected")
-        changed = con.execute("UPDATE actions SET status='dispatching' WHERE action_id=? AND repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='reserved'", (aid, repo, issue, phase, owner, generation)).rowcount
+        changed = con.execute("UPDATE actions SET status='dispatching',dispatch_token_hash=? WHERE action_id=? AND repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='reserved'", (token_hash, aid, repo, issue, phase, owner, generation)).rowcount
         if not changed:
             raise ValueError("action start compare-and-set failed")
-        event(con, repo, issue, phase, generation, aid, "action_dispatch_started", {"owner": owner})
+        event(con, repo, issue, phase, generation, aid, "action_dispatch_started", {"owner": owner, "dispatch_token_hash": token_hash})
         con.commit()
+        return token
     except Exception:
         con.rollback()
         raise
 
 
-def finish_action(con, repo, issue, phase, owner, generation, aid, evidence):
+def finish_action(con, repo, issue, phase, owner, generation, aid, token, evidence):
     if not isinstance(evidence, str) or len(evidence.strip()) < 10 or len(evidence.strip()) > 500:
         raise ValueError("completion evidence must be 10-500 characters")
+    if not isinstance(token, str) or not token:
+        raise ValueError("dispatch token is required")
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
     begin(con)
     try:
         active = con.execute("SELECT 1 FROM claims WHERE repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='active'", (repo, issue, phase, owner, generation)).fetchone()
         if not active:
             raise ValueError("stale generation or owner: action finish rejected")
-        changed = con.execute("UPDATE actions SET status='attempt_finished' WHERE action_id=? AND repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='dispatching'", (aid, repo, issue, phase, owner, generation)).rowcount
+        changed = con.execute("UPDATE actions SET status='attempt_finished',dispatch_token_hash=NULL WHERE action_id=? AND repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND dispatch_token_hash=? AND status='dispatching'", (aid, repo, issue, phase, owner, generation, token_hash)).rowcount
         if not changed:
             raise ValueError("action finish compare-and-set failed")
         event(con, repo, issue, phase, generation, aid, "action_attempt_finished", {"evidence": evidence.strip(), "owner": owner})
@@ -258,7 +269,7 @@ def acknowledge(con, repo, issue, phase, owner, generation, aid, task_id):
         active = con.execute("SELECT 1 FROM claims WHERE repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='active'", (repo, issue, phase, owner, generation)).fetchone()
         if not active:
             raise ValueError("stale generation or owner: acknowledgment rejected")
-        changed = con.execute("UPDATE actions SET status='acknowledged',task_id=?,acknowledged_at=? WHERE action_id=? AND repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='dispatching'", (task_id, timestamp(), aid, repo, issue, phase, owner, generation)).rowcount
+        changed = con.execute("UPDATE actions SET status='acknowledged',task_id=?,acknowledged_at=?,dispatch_token_hash=NULL WHERE action_id=? AND repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='dispatching'", (task_id, timestamp(), aid, repo, issue, phase, owner, generation)).rowcount
         if not changed:
             existing = con.execute("SELECT status,task_id FROM actions WHERE action_id=? AND repo=? AND issue=? AND phase=? AND owner=? AND generation=?", (aid, repo, issue, phase, owner, generation)).fetchone()
             if not existing or existing["status"] not in ("acknowledged", "effect_verified") or existing["task_id"] != task_id:
@@ -320,7 +331,7 @@ def scan(con, repo, inventory):
             effect = "present" if task and (not row["task_id"] or task["id"] == row["task_id"]) else "missing"
             if row["status"] in ("reserved", "dispatching", "attempt_finished") and task:
                 # Recover a process crash after task creation and before acknowledgment.
-                con.execute("UPDATE actions SET status='acknowledged',task_id=?,acknowledged_at=? WHERE action_id=? AND status IN ('reserved','dispatching','attempt_finished')", (task["id"], as_of, row["action_id"]))
+                con.execute("UPDATE actions SET status='acknowledged',task_id=?,acknowledged_at=?,dispatch_token_hash=NULL WHERE action_id=? AND status IN ('reserved','dispatching','attempt_finished')", (task["id"], as_of, row["action_id"]))
                 event(con, repo, row["issue"], row["phase"], row["generation"], row["action_id"], "action_acknowledged_recovered", {"task_id": task["id"]})
                 row = dict(row)
                 row["task_id"] = task["id"]
@@ -363,7 +374,7 @@ def rebuild(con, repo, inventory):
             elif row["kind"] == "action_reserved":
                 con.execute("INSERT INTO actions(action_id,repo,issue,phase,verb,attempt,generation,owner,status,reserved_at) VALUES(?,?,?,?,?,?,?,?,'reserved',?)", (row["action_id"], repo, row["issue"], row["phase"], details["verb"], details["attempt"], row["generation"], details["owner"], row["at"]))
             elif row["kind"] == "action_dispatch_started":
-                con.execute("UPDATE actions SET status='dispatching' WHERE action_id=?", (row["action_id"],))
+                con.execute("UPDATE actions SET status='dispatching',dispatch_token_hash=? WHERE action_id=?", (details["dispatch_token_hash"], row["action_id"]))
             elif row["kind"] == "action_attempt_finished":
                 con.execute("UPDATE actions SET status='attempt_finished' WHERE action_id=?", (row["action_id"],))
             elif row["kind"] in ("action_acknowledged", "action_acknowledged_recovered"):
@@ -391,19 +402,19 @@ def dispatch(con, db_path, repo, issue, phase, owner, generation, verb, adapter,
         if not created:
             # The adapter may have created a session before its caller crashed. Never retry it.
             raise ValueError(f"action already reserved ({row['status']}); reconcile action {row['action_id']} before any retry")
-        start_action(con, repo, issue, phase, owner, generation, row["action_id"])
+        token = start_action(con, repo, issue, phase, owner, generation, row["action_id"])
         request = {"repo": repo, "issue": issue, "phase": phase, "generation": generation, "owner": owner, "verb": verb, "action_id": row["action_id"]}
         if context:
             request.update(context)
         result = subprocess.run([str(executable)], input=json.dumps(request), capture_output=True, text=True, timeout=120, pass_fds=(guard.fileno(),))
         if result.returncode:
-            finish_action(con, repo, issue, phase, owner, generation, row["action_id"], f"Adapter returned exit code {result.returncode}; call ended without a task ID")
+            finish_action(con, repo, issue, phase, owner, generation, row["action_id"], token, f"Adapter returned exit code {result.returncode}; call ended without a task ID")
             raise ValueError(f"adapter failed; reservation {row['action_id']} remains for reconciliation: {result.stderr.strip()[:300]}")
         try:
             answer = json.loads(result.stdout)
             task_id = valid_id(answer["task_id"], "task ID")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            finish_action(con, repo, issue, phase, owner, generation, row["action_id"], "Adapter call returned without a valid task ID; reconcile the live inventory")
+            finish_action(con, repo, issue, phase, owner, generation, row["action_id"], token, "Adapter call returned without a valid task ID; reconcile the live inventory")
             raise ValueError(f"adapter returned no valid task_id; reservation {row['action_id']} remains for reconciliation")
         acknowledge(con, repo, issue, phase, owner, generation, row["action_id"], task_id)
         return {"action_id": row["action_id"], "task_id": task_id, "status": "acknowledged"}
@@ -428,6 +439,7 @@ def main():
     for name in ("start", "finish"):
         sub.choices[name].add_argument("--generation", type=int, required=True)
         sub.choices[name].add_argument("--action-id", required=True)
+    sub.choices["finish"].add_argument("--token", required=True)
     sub.choices["finish"].add_argument("--evidence", required=True)
     sub.choices["dispatch"].add_argument("--generation", type=int, required=True)
     sub.choices["dispatch"].add_argument("--verb", required=True)
@@ -472,12 +484,12 @@ def main():
         elif args.command == "start":
             if args.generation <= 0:
                 raise ValueError("generation must be positive")
-            start_action(con, repo, args.issue, args.phase, args.owner, args.generation, args.action_id)
-            result = {"started": True, "action_id": args.action_id}
+            token = start_action(con, repo, args.issue, args.phase, args.owner, args.generation, args.action_id)
+            result = {"started": True, "action_id": args.action_id, "token": token}
         elif args.command == "finish":
             if args.generation <= 0:
                 raise ValueError("generation must be positive")
-            finish_action(con, repo, args.issue, args.phase, args.owner, args.generation, args.action_id, args.evidence)
+            finish_action(con, repo, args.issue, args.phase, args.owner, args.generation, args.action_id, args.token, args.evidence)
             result = {"finished": True, "action_id": args.action_id}
         elif args.command == "dispatch":
             if args.generation <= 0:

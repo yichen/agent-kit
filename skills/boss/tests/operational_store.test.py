@@ -231,12 +231,15 @@ class OperationalStoreTests(unittest.TestCase):
     def test_host_task_dispatch_cannot_be_abandoned_until_call_finishes(self):
         claim = self.claim()
         action = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
-        self.call(*self.command("start", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"]))
+        started = self.call(*self.command("start", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"]))
         inventory = self.inventory([])
         abandon_args = self.command("abandon", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--inventory", inventory, "--evidence", "Fresh inventory is empty while host task call is in flight")
         self.call(*abandon_args, expected=2)
+        self.call(*self.command("finish", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--token", "wrong-token", "--evidence", "Host task tool returned without creating a task"), expected=2)
+        rebuilt_inventory = self.inventory([], "during-call-rebuild.json")
+        self.call(*self.command("rebuild", "--inventory", rebuilt_inventory))
         self.call(*self.command("release", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"])), expected=2)
-        self.call(*self.command("finish", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--evidence", "Host task tool returned without creating a task"))
+        self.call(*self.command("finish", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--token", started["token"], "--evidence", "Host task tool returned without creating a task"))
         inventory = self.inventory([])
         self.call(*self.command("abandon", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], "--inventory", inventory, "--evidence", "Fresh inventory after completed host call is empty"))
         next_action = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
