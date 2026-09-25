@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import nullcontext
+from urllib.parse import quote
 
 import reconcile_ledger as reconcile
 
@@ -217,8 +218,8 @@ def classify_open_prs(ledger: dict, prs: list[dict]) -> tuple[list[tuple[str, in
             continue
         matches = [row for row in ledger["objectives"] if number in row.get("pull_requests", [])]
         if len(matches) == 1:
-            quarantined.append({"number": number, "reason": "live issue references conflict with linked objective",
-                                "candidate_objectives": [matches[0]["id"]]})
+            # discover_open_prs succeeded and confirmed any live references agree.
+            continue
         elif len(matches) > 1:
             quarantined.append({"number": number, "reason": "PR is linked to multiple objectives",
                                 "candidate_objectives": [row["id"] for row in matches]})
@@ -247,6 +248,14 @@ def current_pr_observations(repo: str, ledger: dict, prs: list[dict], additions:
                 raise BridgeError(f"PR #{number}: current head missing")
             result = run(["gh", "pr", "checks", "--repo", repo, str(number), "--required",
                           "--json", "name,state,startedAt"])
+            no_required_reported = (result.returncode == 1 and
+                                    re.fullmatch(r"no required checks reported on the '.+' branch\s*", result.stderr.strip()) is not None)
+            if no_required_reported:
+                # Preserve the PR and its ordinary check state even when no
+                # required-check policy is configured. The independent policy
+                # lookup below will leave required empty and block verification.
+                result = run(["gh", "pr", "checks", "--repo", repo, str(number),
+                              "--json", "name,state,startedAt"])
             if result.returncode not in (0, 8):
                 raise BridgeError(f"PR #{number}: required check inventory failed: {result.stderr.strip()}")
             try:
@@ -262,7 +271,7 @@ def current_pr_observations(repo: str, ledger: dict, prs: list[dict], additions:
                 raise BridgeError(f"PR #{number}: malformed post-check head observation") from exc
             if verified_head != head:
                 raise BridgeError(f"PR #{number}: head changed during check inventory; retry scan")
-            required = sorted({check.get("name") for check in raw_checks if isinstance(check, dict) and isinstance(check.get("name"), str)})
+            required = required_contexts(repo, pr.get("baseRefName"))
             mergeable = pr.get("mergeable")
         if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
             raise BridgeError(f"PR #{number}: current head missing")
@@ -334,6 +343,58 @@ def project_prs(ledger: dict, additions: list[tuple[str, int]]) -> dict:
             prs.append(number)
             prs.sort()
     return projected
+
+
+def required_contexts(repo: str, branch: str) -> list[str]:
+    """Read configured required context names independently from check results."""
+    if not isinstance(branch, str) or not branch:
+        raise BridgeError("PR base branch is missing")
+    encoded_branch = quote(branch, safe="")
+    result = run(["gh", "api", f"repos/{repo}/rules/branches/{encoded_branch}?per_page=100"])
+    if result.returncode:
+        raise BridgeError(f"cannot read active branch rules for {branch}: {result.stderr.strip()}")
+    try:
+        rules = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"malformed active branch rules for {branch}") from exc
+    if not isinstance(rules, list) or len(rules) >= 100:
+        raise BridgeError(f"active branch rules for {branch} are malformed or truncated")
+    contexts = set()
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise BridgeError(f"malformed active branch rule for {branch}")
+        if rule.get("type") != "required_status_checks":
+            continue
+        params = rule.get("parameters")
+        required = params.get("required_status_checks") if isinstance(params, dict) else None
+        if not isinstance(required, list) or any(not isinstance(item, dict) or
+                                                  not isinstance(item.get("context"), str) or
+                                                  not item["context"] for item in required):
+            raise BridgeError(f"malformed required status check rule for {branch}")
+        contexts.update(item["context"] for item in required)
+
+    protected = run(["gh", "api", f"repos/{repo}/branches/{encoded_branch}/protection/required_status_checks"])
+    if protected.returncode:
+        if "404" not in protected.stderr:
+            raise BridgeError(f"cannot read branch protection checks for {branch}: {protected.stderr.strip()}")
+    else:
+        try:
+            protection = json.loads(protected.stdout)
+        except json.JSONDecodeError as exc:
+            raise BridgeError(f"malformed branch protection checks for {branch}") from exc
+        if not isinstance(protection, dict):
+            raise BridgeError(f"malformed branch protection checks for {branch}")
+        legacy = protection.get("contexts", [])
+        checks = protection.get("checks", [])
+        if not isinstance(legacy, list) or any(not isinstance(name, str) or not name for name in legacy):
+            raise BridgeError(f"malformed branch protection contexts for {branch}")
+        if not isinstance(checks, list) or any(not isinstance(item, dict) or
+                                                not isinstance(item.get("context"), str) or
+                                                not item["context"] for item in checks):
+            raise BridgeError(f"malformed branch protection check rules for {branch}")
+        contexts.update(legacy)
+        contexts.update(item["context"] for item in checks)
+    return sorted(contexts)
 
 
 def carry_observed_prs(canonical: dict, previous: dict) -> dict:

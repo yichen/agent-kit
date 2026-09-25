@@ -71,7 +71,11 @@ exact head SHA, mergeability, exact `required_checks` names, and one check
 observation per name for that same head. Partial pass counts never authorize
 `VERIFY_MERGE`. A missing or duplicated required context requests owner
 recovery, a failed, stale (over 45 minute), or wrong-head context requests PR
-repair, and pending checks wait only while their start time is fresh.
+repair, and pending checks wait only while their start time is fresh. The
+required-context list comes from active branch rules and branch protection,
+independent of check results. If no required-check policy is configured, the PR
+stays visible with an owner-recovery action; unrelated PRs and issues continue
+through the same scan.
 `VERIFY_MERGE` is an inspection task, **not merge authorization**: the worker
 must independently verify every required CI context on the exact current PR
 head, current-head independent review, repository merge rules, and human gates

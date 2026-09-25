@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import plistlib
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 
@@ -130,6 +131,84 @@ class RuntimeBridgeTests(unittest.TestCase):
                         bridge.discover_open_prs(ledger, prs)
                 else:
                     self.assertEqual(bridge.discover_open_prs(ledger, prs), [])
+
+    def test_existing_clean_ledger_link_is_not_quarantined(self):
+        ledger = {"objectives": [objective(pull_requests=[603])]}
+        pr = {"number": 603, "state": "OPEN", "body": "Closes #523",
+              "title": "Implement #523", "headRefName": "codex/523-feature"}
+        additions, quarantined = bridge.classify_open_prs(ledger, [pr])
+        self.assertEqual(additions, [])
+        self.assertEqual(quarantined, [])
+
+    def test_required_contexts_come_from_rules_not_returned_check_rows(self):
+        ledger = {"objectives": [objective()]}
+        head = "a" * 40
+        pr = {"number": 603, "state": "OPEN", "body": "Closes #523", "title": "Implement #523",
+              "headRefName": "codex/523-feature", "headRefOid": head,
+              "baseRefName": "main", "mergeable": "MERGEABLE"}
+        additions, quarantined = bridge.classify_open_prs(ledger, [pr])
+        original_run = bridge.run
+
+        def fake_run(command):
+            if command[:3] == ["gh", "pr", "checks"]:
+                return subprocess.CompletedProcess(command, 0,
+                    json.dumps([{"name": "Build", "state": "SUCCESS", "startedAt": None}]), "")
+            if command[:3] == ["gh", "pr", "view"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps({"headRefOid": head}), "")
+            if command[1] == "api" and "rules/branches/" in command[2]:
+                return subprocess.CompletedProcess(command, 0, json.dumps([
+                    {"type": "required_status_checks", "parameters": {
+                        "required_status_checks": [{"context": "Build"}, {"context": "Unit tests"}]}}
+                ]), "")
+            if command[1] == "api" and "/protection/required_status_checks" in command[2]:
+                return subprocess.CompletedProcess(command, 1, "", "HTTP 404")
+            raise AssertionError(f"unexpected command: {command}")
+
+        bridge.run = fake_run
+        try:
+            observed = bridge.current_pr_observations("example/project", ledger, [pr], additions,
+                                                       quarantined, fixtures=False)
+        finally:
+            bridge.run = original_run
+        self.assertEqual(observed[0]["observation"]["required_checks"], ["Build", "Unit tests"])
+        self.assertEqual([check["name"] for check in observed[0]["observation"]["checks"]], ["Build"])
+
+    def test_absent_required_check_policy_preserves_pr_as_recovery_action(self):
+        head = "a" * 40
+        ledger = {"repository": "example/project", "objectives": [
+            objective(pull_requests=[603], pull_request_states={"603": "OPEN"})]}
+        pr = {"number": 603, "state": "OPEN", "body": "", "title": "existing PR",
+              "headRefName": "codex/523-feature", "headRefOid": head,
+              "baseRefName": "main", "mergeable": "MERGEABLE"}
+        original_run = bridge.run
+
+        def fake_run(command):
+            if command[:3] == ["gh", "pr", "checks"] and "--required" in command:
+                return subprocess.CompletedProcess(command, 1, "",
+                    "no required checks reported on the 'codex/issue-13-pr-first' branch")
+            if command[:3] == ["gh", "pr", "checks"]:
+                return subprocess.CompletedProcess(command, 0,
+                    json.dumps([{"name": "test", "state": "SUCCESS", "startedAt": None}]), "")
+            if command[:3] == ["gh", "pr", "view"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps({"headRefOid": head}), "")
+            if command[1] == "api" and "rules/branches/" in command[2]:
+                return subprocess.CompletedProcess(command, 0, "[]", "")
+            if command[1] == "api" and "/protection/required_status_checks" in command[2]:
+                return subprocess.CompletedProcess(command, 1, "", "HTTP 404")
+            raise AssertionError(f"unexpected command: {command}")
+
+        bridge.run = fake_run
+        try:
+            additions, quarantined = bridge.classify_open_prs(ledger, [pr])
+            observations = bridge.current_pr_observations("example/project", ledger, [pr], additions,
+                                                            quarantined, fixtures=False)
+        finally:
+            bridge.run = original_run
+        self.assertEqual(observations[0]["observation"]["required_checks"], [])
+        ledger["open_pull_requests"] = observations
+        actions, waiting = bridge.reconcile.decide(ledger, {}, datetime.now(timezone.utc))
+        self.assertEqual([(item["verb"], item["pr"]) for item in actions], [("RECOVER_OWNER", 603)])
+        self.assertEqual(waiting, [])
 
     def test_every_open_pr_is_linked_or_quarantined_without_duplicate_links(self):
         ledger = {"objectives": [objective(), objective(604)]}

@@ -130,8 +130,7 @@ def pr_status(repo, row, number, observation, task_id, tasks, now):
     if (not isinstance(required, list) or not required or
             any(not isinstance(name, str) or not name.strip() for name in required) or
             len(set(required)) != len(required) or not isinstance(checks, list)):
-        verb = "RECOVER_OWNER" if task_id and task_id in tasks else "QUARANTINE_PR"
-        return action(repo, row, verb, task_id=task_id, pr=number, head=head,
+        return action(repo, row, "RECOVER_OWNER", task_id=task_id, pr=number, head=head,
                       reason="required exact-head CI contexts are missing or malformed"), None
 
     by_name = {}
@@ -168,8 +167,7 @@ def pr_status(repo, row, number, observation, task_id, tasks, now):
         reason = "required current-head CI failed, is stale, or belongs to another head"
         return action(repo, row, verb, task_id=task_id, pr=number, head=head, reason=reason), None
     if missing:
-        verb = "RECOVER_OWNER" if task_id and task_id in tasks else "QUARANTINE_PR"
-        return action(repo, row, verb, task_id=task_id, pr=number, head=head,
+        return action(repo, row, "RECOVER_OWNER", task_id=task_id, pr=number, head=head,
                       reason="required CI context is absent or duplicated"), None
     if pending:
         return None, {"objective": rid, "reason": "required_pr_checks_pending", "pr": number,
