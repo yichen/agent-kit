@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import base64
 import contextlib
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
-import selectors
-import shutil
+import secrets
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -43,23 +46,264 @@ def run(argv, *, timeout=30, input_text=None):
     return result.stdout
 
 
-class AppServer:
-    """JSON-RPC client through an already running app-server proxy; never starts a daemon."""
+APP_SERVER_SOCKET_RELATIVE_PATH = Path("app-server-control") / "app-server-control.sock"
+WEBSOCKET_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_HTTP_HEADER_BYTES = 16 * 1024
+MAX_WEBSOCKET_MESSAGE_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, timeout=8, process_factory=subprocess.Popen):
-        codex = shutil.which("codex")
-        if not codex:
-            raise AdapterError("Codex CLI is not installed")
-        try:
-            self.proc = process_factory([codex, "app-server", "proxy"], stdin=subprocess.PIPE,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, bufsize=1)
-        except OSError as exc:
-            raise AdapterError(f"cannot connect to the existing Codex app-server: {exc}") from exc
+
+def app_server_socket_path(*, environ=None, home=None) -> Path:
+    """Resolve the local Codex control socket without creating or starting anything."""
+    environ = os.environ if environ is None else environ
+    home = Path.home() if home is None else Path(home)
+    configured = environ.get("CODEX_HOME")
+    root = Path(configured).expanduser() if configured else home.expanduser() / ".codex"
+    if not root.is_absolute():
+        raise AdapterError("CODEX_HOME must be an absolute path")
+    return root / APP_SERVER_SOCKET_RELATIVE_PATH
+
+
+def connect_unix_socket(path: Path, timeout: float):
+    """Connect only to the existing local Unix socket; this never launches a daemon."""
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(timeout)
+    try:
+        connection.connect(str(path))
+    except OSError as exc:
+        connection.close()
+        raise AdapterError(f"cannot connect to Codex app-server socket {path}: {exc}") from exc
+    return connection
+
+
+class UnixWebSocket:
+    """Small bounded RFC 6455 client for Codex's local Unix-socket transport."""
+
+    def __init__(self, connection, *, timeout=8):
+        self.connection = connection
         self.timeout = timeout
+        self.buffer = bytearray()
+        self.handshake_complete = False
+        self.close_sent = False
+        self.closed = False
+
+    @classmethod
+    def connect(cls, path, *, timeout=8, connector=connect_unix_socket):
+        connection = connector(Path(path), timeout)
+        websocket = cls(connection, timeout=timeout)
+        try:
+            websocket.handshake()
+            return websocket
+        except socket.timeout as exc:
+            websocket.close()
+            raise AdapterError("timed out during Codex app-server WebSocket handshake") from exc
+        except Exception:
+            websocket.close()
+            raise
+
+    def _set_deadline(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Codex app-server socket timed out")
+        self.connection.settimeout(remaining)
+
+    def _sendall(self, data, deadline):
+        self._set_deadline(deadline)
+        self.connection.sendall(data)
+
+    def _recv_exact(self, length, deadline):
+        while len(self.buffer) < length:
+            self._set_deadline(deadline)
+            chunk = self.connection.recv(max(1, min(65536, length - len(self.buffer))))
+            if not chunk:
+                raise ConnectionError("Codex app-server closed the WebSocket")
+            self.buffer.extend(chunk)
+        result = bytes(self.buffer[:length])
+        del self.buffer[:length]
+        return result
+
+    def handshake(self):
+        deadline = time.monotonic() + self.timeout
+        client_key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        request = (
+            "GET / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {client_key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        self._sendall(request, deadline)
+        while b"\r\n\r\n" not in self.buffer:
+            if len(self.buffer) >= MAX_HTTP_HEADER_BYTES:
+                raise AdapterError("Codex app-server WebSocket response headers exceed the size limit")
+            self._set_deadline(deadline)
+            chunk = self.connection.recv(min(4096, MAX_HTTP_HEADER_BYTES - len(self.buffer)))
+            if not chunk:
+                raise ConnectionError("Codex app-server closed during the WebSocket handshake")
+            self.buffer.extend(chunk)
+        raw_headers, remainder = bytes(self.buffer).split(b"\r\n\r\n", 1)
+        self.buffer = bytearray(remainder)
+        try:
+            lines = raw_headers.decode("iso-8859-1").split("\r\n")
+        except UnicodeDecodeError as exc:
+            raise AdapterError("Codex app-server returned invalid WebSocket response headers") from exc
+        if not lines or not re.fullmatch(r"HTTP/1\.[01] 101(?: .*)?", lines[0]):
+            status = lines[0][:100] if lines else "empty response"
+            raise AdapterError(f"Codex app-server WebSocket upgrade rejected: {status}")
+        headers = {}
+        for line in lines[1:]:
+            if ":" not in line:
+                raise AdapterError("Codex app-server returned a malformed WebSocket response header")
+            name, value = line.split(":", 1)
+            headers.setdefault(name.strip().lower(), []).append(value.strip())
+        connection_tokens = {token.strip().lower()
+                             for value in headers.get("connection", []) for token in value.split(",")}
+        upgrade_values = headers.get("upgrade", [])
+        accept_values = headers.get("sec-websocket-accept", [])
+        expected_accept = base64.b64encode(hashlib.sha1(client_key.encode("ascii") + WEBSOCKET_GUID).digest()).decode("ascii")
+        if (len(upgrade_values) != 1
+                or upgrade_values[0].lower() != "websocket"
+                or "upgrade" not in connection_tokens
+                or len(accept_values) != 1
+                or not hmac.compare_digest(accept_values[0], expected_accept)):
+            raise AdapterError("Codex app-server WebSocket handshake validation failed")
+        if "sec-websocket-extensions" in headers:
+            raise AdapterError("Codex app-server negotiated an unsupported WebSocket extension")
+        self.handshake_complete = True
+
+    def _send_frame(self, opcode, payload, deadline, *, final=True):
+        if self.closed:
+            raise ConnectionError("Codex app-server WebSocket is closed")
+        payload = bytes(payload)
+        if len(payload) > MAX_WEBSOCKET_MESSAGE_BYTES:
+            raise AdapterError("Codex app-server WebSocket message exceeds the size limit")
+        first = (0x80 if final else 0) | opcode
+        size = len(payload)
+        if size < 126:
+            header = bytes((first, 0x80 | size))
+        elif size <= 0xFFFF:
+            header = bytes((first, 0x80 | 126)) + struct.pack("!H", size)
+        else:
+            header = bytes((first, 0x80 | 127)) + struct.pack("!Q", size)
+        mask = secrets.token_bytes(4)
+        masked = bytes(value ^ mask[index & 3] for index, value in enumerate(payload))
+        self._sendall(header + mask + masked, deadline)
+
+    def send_text(self, text, deadline):
+        try:
+            payload = text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise AdapterError("Codex app-server request is not valid UTF-8") from exc
+        self._send_frame(0x1, payload, deadline)
+
+    def _recv_frame(self, deadline):
+        first, second = self._recv_exact(2, deadline)
+        final = bool(first & 0x80)
+        if first & 0x70:
+            raise AdapterError("Codex app-server sent a WebSocket frame with reserved bits set")
+        opcode = first & 0x0F
+        if second & 0x80:
+            raise AdapterError("Codex app-server sent a masked server frame")
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(2, deadline))[0]
+            if length < 126:
+                raise AdapterError("Codex app-server sent a non-canonical WebSocket frame length")
+        elif length == 127:
+            extended = struct.unpack("!Q", self._recv_exact(8, deadline))[0]
+            if extended & (1 << 63) or extended <= 0xFFFF:
+                raise AdapterError("Codex app-server sent an invalid WebSocket frame length")
+            length = extended
+        if length > MAX_WEBSOCKET_MESSAGE_BYTES:
+            raise AdapterError("Codex app-server WebSocket frame exceeds the size limit")
+        if opcode >= 0x8 and (not final or length > 125):
+            raise AdapterError("Codex app-server sent an invalid WebSocket control frame")
+        if opcode not in (0x0, 0x1, 0x2, 0x8, 0x9, 0xA):
+            raise AdapterError("Codex app-server sent an unsupported WebSocket opcode")
+        return final, opcode, self._recv_exact(length, deadline)
+
+    def recv_text(self, deadline):
+        fragments = None
+        while True:
+            final, opcode, payload = self._recv_frame(deadline)
+            if opcode == 0x8:
+                if len(payload) == 1:
+                    raise AdapterError("Codex app-server sent an invalid WebSocket close payload")
+                if len(payload) >= 2:
+                    code = struct.unpack("!H", payload[:2])[0]
+                    if code < 1000 or code >= 5000 or code in (1004, 1005, 1006, 1015):
+                        raise AdapterError("Codex app-server sent an invalid WebSocket close code")
+                    try:
+                        payload[2:].decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise AdapterError("Codex app-server sent an invalid WebSocket close reason") from exc
+                if not self.close_sent:
+                    try:
+                        self._send_frame(0x8, payload[:125], min(deadline, time.monotonic() + 0.2))
+                        self.close_sent = True
+                    except (OSError, TimeoutError, AdapterError):
+                        pass
+                raise ConnectionError("Codex app-server closed the WebSocket")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload, deadline)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode == 0x2:
+                raise AdapterError("Codex app-server sent a binary JSON-RPC message")
+            if opcode == 0x1:
+                if fragments is not None:
+                    raise AdapterError("Codex app-server started a new message before finishing a fragmented one")
+                if final:
+                    try:
+                        return payload.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise AdapterError("Codex app-server sent invalid UTF-8 in a text frame") from exc
+                fragments = bytearray(payload)
+                continue
+            if fragments is None:
+                raise AdapterError("Codex app-server sent a continuation frame without a message")
+            fragments.extend(payload)
+            if len(fragments) > MAX_WEBSOCKET_MESSAGE_BYTES:
+                raise AdapterError("Codex app-server fragmented message exceeds the size limit")
+            if final:
+                try:
+                    return fragments.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise AdapterError("Codex app-server sent invalid UTF-8 in a text frame") from exc
+
+    def close(self):
+        if self.closed:
+            return
+        if self.handshake_complete and not self.close_sent:
+            deadline = time.monotonic() + min(self.timeout, 0.2)
+            try:
+                self._send_frame(0x8, struct.pack("!H", 1000), deadline)
+                self.close_sent = True
+                while time.monotonic() < deadline:
+                    final, opcode, payload = self._recv_frame(deadline)
+                    if opcode == 0x8:
+                        break
+                    if opcode == 0x9:
+                        self._send_frame(0xA, payload, deadline)
+            except (OSError, TimeoutError, socket.timeout, AdapterError):
+                pass
+        self.closed = True
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.connection.close()
+
+
+class AppServer:
+    """JSON-RPC client on the existing local socket; it never starts a daemon."""
+
+    def __init__(self, timeout=8, socket_path=None, socket_connector=connect_unix_socket):
+        self.timeout = timeout
+        path = Path(socket_path) if socket_path is not None else app_server_socket_path()
+        self.websocket = UnixWebSocket.connect(path, timeout=timeout, connector=socket_connector)
         self.next_id = 1
-        self.buffer = b""
-        os.set_blocking(self.proc.stdout.fileno(), False)
         try:
             self.call("initialize", {"clientInfo": {"name": "agent-kit", "title": "Agent Kit", "version": "1"},
                                       "capabilities": {"experimentalApi": False}})
@@ -69,59 +313,48 @@ class AppServer:
             raise
 
     def notify(self, method, params):
-        self.proc.stdin.write(json.dumps({"method": method, "params": params}, separators=(",", ":")) + "\n")
-        self.proc.stdin.flush()
+        message = json.dumps({"method": method, "params": params}, separators=(",", ":"))
+        try:
+            self.websocket.send_text(message, time.monotonic() + self.timeout)
+        except (OSError, TimeoutError, socket.timeout, ConnectionError) as exc:
+            raise AdapterError(f"Codex app-server notification {method} failed: {exc}") from exc
 
     def call(self, method, params):
         request_id = self.next_id
         self.next_id += 1
-        self.proc.stdin.write(json.dumps({"id": request_id, "method": method, "params": params}, separators=(",", ":")) + "\n")
-        self.proc.stdin.flush()
-        selector = selectors.DefaultSelector()
-        selector.register(self.proc.stdout.fileno(), selectors.EVENT_READ)
+        message = json.dumps({"id": request_id, "method": method, "params": params}, separators=(",", ":"))
         deadline = time.monotonic() + self.timeout
         try:
+            self.websocket.send_text(message, deadline)
             while True:
-                left = deadline - time.monotonic()
-                if left <= 0 or not selector.select(left):
-                    raise AdapterError(f"Codex app-server timed out during {method}; inspect live task state before retrying")
-                chunk = os.read(self.proc.stdout.fileno(), 65536)
-                if not chunk:
-                    err = self.proc.stderr.read(500).strip() if self.proc.poll() is not None else ""
-                    raise AdapterError("Codex app-server connection closed" + (f": {err[-240:]}" if err else ""))
-                self.buffer += chunk
-                while b"\n" in self.buffer:
-                    line, self.buffer = self.buffer.split(b"\n", 1)
-                    try:
-                        message = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    if message.get("id") != request_id:
-                        continue
-                    if "error" in message:
-                        error = message["error"]
-                        raise RpcError(f"Codex app-server {method} failed: {error.get('message', 'unknown error')[:300]}", definitive=True)
-                    return message.get("result", {})
-        finally:
-            selector.close()
+                text = self.websocket.recv_text(deadline)
+                try:
+                    response = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise AdapterError("Codex app-server sent malformed JSON-RPC") from exc
+                if not isinstance(response, dict):
+                    raise AdapterError("Codex app-server sent a malformed JSON-RPC message")
+                if response.get("id") != request_id:
+                    continue
+                if "error" in response:
+                    error = response["error"]
+                    message = error.get("message", "unknown error") if isinstance(error, dict) else "unknown error"
+                    raise RpcError(f"Codex app-server {method} failed: {message[:300]}", definitive=True)
+                result = response.get("result", {})
+                if not isinstance(result, dict):
+                    raise AdapterError("Codex app-server returned a malformed JSON-RPC result")
+                return result
+        except (TimeoutError, socket.timeout) as exc:
+            raise AdapterError(f"Codex app-server timed out during {method}; inspect live task state before retrying") from exc
+        except ConnectionError as exc:
+            raise AdapterError("Codex app-server connection closed") from exc
+        except OSError as exc:
+            raise AdapterError(f"Codex app-server transport failed during {method}: {exc}") from exc
 
     def close(self):
-        if not getattr(self, "proc", None):
-            return
-        try:
-            if self.proc.stdin:
-                self.proc.stdin.close()
-            self.proc.wait(timeout=1)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                self.proc.kill()
-        finally:
-            for stream in (self.proc.stdout, self.proc.stderr):
-                if stream:
-                    stream.close()
+        websocket = getattr(self, "websocket", None)
+        if websocket:
+            websocket.close()
 
     def __enter__(self):
         return self
