@@ -38,6 +38,21 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(all(a["verb"] == "LAUNCH_TASK" for a in actions))
         self.assertEqual(actions, mod.decide(ledger, {})[0])
 
+    def test_merged_code_open_issue_reconciles_acceptance_without_relaunch(self):
+        task = "01a0d8dc-b312-70d2-ad86-b58088dd22d8"
+        cases = [
+            row("#330", pull_requests=[491], pull_request_states={"491": "MERGED"}),
+            row("#533", coding_task_id=task, pull_requests=[571], pull_request_states={"571": "MERGED"}),
+        ]
+        for item in cases:
+            with self.subTest(issue=item["issue_number"]):
+                actions, waiting = mod.decide({"repository": "example/project", "objectives": [item]},
+                                              {task: {"id": task, "status": "completed"}})
+                self.assertEqual(waiting, [])
+                self.assertEqual(actions[0]["verb"], "RECONCILE_ISSUE")
+                self.assertEqual(actions[0]["linked_prs"], item["pull_requests"])
+                self.assertNotEqual(actions[0]["verb"], "LAUNCH_TASK")
+
     def test_ended_turn_is_resumed_and_unknown_turn_fails_closed(self):
         task = "01a0d8dc-b312-70d2-ad86-b58088dd22d8"
         ledger = {"repository": "example/project", "objectives": [row("#356", coding_task_id=task)]}

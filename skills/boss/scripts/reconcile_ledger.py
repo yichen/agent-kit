@@ -82,7 +82,8 @@ def complete(row):
 
 def action(repo, row, verb, *, task_id=None, pr=None, head=None, reason=None):
     identity = {"repo": repo, "objective": row["id"], "issue": row.get("issue_number"),
-                "verb": verb, "task_id": task_id, "pr": pr, "head": head}
+                "verb": verb, "task_id": task_id, "pr": pr, "head": head,
+                "linked_prs": list(row.get("pull_requests") or [])}
     key = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return {"id": hashlib.sha256(key.encode()).hexdigest()[:24], **identity,
             "reason": reason or verb}
@@ -143,9 +144,15 @@ def decide(ledger, tasks):
                                       reason="conflict or current-head CI failure"))
             elif obs.get("merge") == "CLEAN" and obs.get("check_count", 0) > 0 and obs.get("passed_count", 0) > 0 and not obs.get("pending_checks"):
                 actions.append(action(repo, row, "VERIFY_MERGE", task_id=task_id, pr=pr, head=head,
-                                      reason="verify independent review and required exact-head checks before merge"))
+                                      reason="review only: verify required exact-head contexts and independent current-head review; this action does not authorize merge"))
             else:
                 waiting.append({"objective": rid, "reason": "pr_checks_pending_or_unknown", "pr": pr, "head": head})
+            continue
+        if prs and all(states.get(str(pr)) == "MERGED" for pr in prs):
+            # Code is already merged. An open issue can still require rollout,
+            # acceptance, or explicit closure; never launch duplicate coding.
+            actions.append(action(repo, row, "RECONCILE_ISSUE", task_id=task_id,
+                                  pr=prs[-1], reason="all linked PRs merged but issue remains open; verify acceptance and closure gates"))
             continue
         if task_id:
             task = tasks.get(task_id)

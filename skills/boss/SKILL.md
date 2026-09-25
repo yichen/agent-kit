@@ -53,14 +53,21 @@ completion.
 
 Each action has a stable `id`, exact repository/objective/issue, task and PR
 identifiers where known, exact current PR head where applicable, and a verb:
-`LAUNCH_TASK`, `RESUME_TASK`, `REPAIR_PR`, `RECOVER_OWNER`, or `VERIFY_MERGE`.
+`LAUNCH_TASK`, `RESUME_TASK`, `REPAIR_PR`, `RECOVER_OWNER`,
+`RECONCILE_ISSUE`, or `VERIFY_MERGE`.
 The host worker may execute only that verb with its existing task tools and
 authorization checks. After the tool succeeds, run `ack --outbox <absolute-path>
 --id <id> --evidence '<task ID or other concrete result>'`. Acknowledgment is
 compare-and-set: an absent or superseded action cannot be acknowledged. The
 next scan verifies the action disappeared from live state; acknowledgment
-alone never completes the ticket. `VERIFY_MERGE` still requires exact-head
-independent review, required CI, repository merge rules, and human gates.
+alone never completes the ticket. `RECONCILE_ISSUE` means code is already
+merged and the worker must inspect issue acceptance, rollout, and human gates;
+it must not start another coding task merely because the issue is open.
+`VERIFY_MERGE` is an inspection task, **not merge authorization**: the worker
+must independently verify every required CI context on the exact current PR
+head, current-head independent review, repository merge rules, and human gates
+before deciding whether any merge is allowed. The script's `passed_count` is
+only a signal to inspect; it is never proof that required contexts passed.
 
 No universal CLI adapter for the Codex task API is installed by this skill.
 In particular, LearnRise's `learnrise-code-exec` runs a coding turn
