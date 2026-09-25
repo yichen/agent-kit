@@ -191,3 +191,29 @@ Verify a live run after installation: fresh GitHub audit, current task status,
 exact PR link, durable outbox, and monitoring-hub receipt. The local Codex
 catalog applies only to tasks on this host; remote task IDs fail closed until
 a supported remote inventory adapter exists.
+
+### Agent-kit scheduler shadow mode
+
+`scripts/scheduler.py` compares the `yichen/agent-kit` `/boss` JSON ledger and
+SQLite claims with GitHub issue/PR state and the live Codex task API. It is
+read-only except for its own atomic last-success receipt. It never launches,
+resumes, claims, merges, or edits issues. Missing app-server access, stale `/boss`
+scan time, or GitHub errors fail closed and do not refresh the receipt. A
+completed comparison with ownership disputes exits 3 and records the disputes;
+the watchdog treats those receipts as unhealthy.
+
+After this code is merged and installed, run
+`scripts/install-host-scheduler.sh install` to load one 900-second shadow job
+and one separate 60-second watchdog. The scheduler writes only to the
+`agent-kit` log and last-success paths under `~/agents-artifacts/boss/`. The
+watchdog checks freshness and reports errors in its own launchd stderr log;
+freshness does not mean assignment is healthy. `scripts/install-host-scheduler.sh
+stop` unloads these two read-only services and never starts another launcher,
+so rollback cannot enable two writers.
+
+Assignment remains disabled in this release. Cutover requires resolved
+ownership discrepancies, passing canaries, a safe existing `agent-kit` pilot
+through verified completion, and recorded human/product acceptance. If no
+eligible pilot issue exists, leave assignment disabled and report the blocker.
+Issue #20 stays unlaunched; this scheduler neither implements nor claims a
+global Pi slot across hosts.
