@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -82,20 +83,41 @@ def inventory(ledger: dict, db: Path, processes: str, now: datetime) -> dict:
             raise BridgeError(f"invalid task ID in ledger: {tid!r}")
     live = writer_ids(processes)
     observations = []
-    # Read-only SQLite URI: this must not create a database or WAL file.
-    connection = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
-    try:
-        for tid in sorted(ids):
-            result = connection.execute("SELECT rollout_path FROM threads WHERE id=?", (tid,)).fetchone()
-            if result is None:
-                raise BridgeError(f"task {tid} missing from local Codex catalog; remote/queued state needs host API")
-            rollout_path = result[0]
-            if not isinstance(rollout_path, str) or not rollout_path:
-                raise BridgeError(f"task {tid} has invalid rollout path")
-            status = "running" if tid in live else rollout_status(Path(rollout_path))
-            observations.append({"id": tid, "status": status})
-    finally:
-        connection.close()
+    # `immutable=1` silently ignores committed rows still in the live WAL.
+    # Query a private, short-lived copy so SQLite can read the WAL without
+    # creating or changing sidecar files in the host Codex catalog directory.
+    def signature(path: Path) -> tuple[int, int, int, int] | None:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+    wal = Path(f"{db}-wal")
+    before = (signature(db), signature(wal))
+    if before[0] is None:
+        raise BridgeError(f"missing local Codex catalog: {db}")
+    with tempfile.TemporaryDirectory(prefix="boss-catalog-") as temporary:
+        snapshot = Path(temporary) / "catalog.sqlite"
+        shutil.copyfile(db, snapshot)
+        if before[1] is not None:
+            shutil.copyfile(wal, Path(f"{snapshot}-wal"))
+        if (signature(db), signature(wal)) != before:
+            raise BridgeError("local Codex catalog changed during snapshot; retry next scan")
+        connection = sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            for tid in sorted(ids):
+                result = connection.execute("SELECT rollout_path FROM threads WHERE id=?", (tid,)).fetchone()
+                if result is None:
+                    raise BridgeError(f"task {tid} missing from local Codex catalog; remote/queued state needs host API")
+                rollout_path = result[0]
+                if not isinstance(rollout_path, str) or not rollout_path:
+                    raise BridgeError(f"task {tid} has invalid rollout path")
+                status = "running" if tid in live else rollout_status(Path(rollout_path))
+                observations.append({"id": tid, "status": status})
+        finally:
+            connection.close()
     return {"as_of": now.isoformat().replace("+00:00", "Z"), "tasks": observations}
 
 
@@ -136,6 +158,9 @@ def discover_open_prs(ledger: dict, prs: list[dict]) -> list[tuple[str, int]]:
             linked_issue = already[0].get("issue_number")
             if (strong and strong != {linked_issue}) or ((title_ids | branch_ids) - {linked_issue}):
                 alerts.append(f"PR #{number}: live issue references conflict with linked objective {already[0]['id']}")
+            continue
+        if len(strong) > 1:
+            alerts.append(f"PR #{number}: multiple tracked closing references {sorted(strong)}")
             continue
         if len(strong) == 1:
             if (title_ids | branch_ids) - strong:

@@ -62,6 +62,28 @@ class RuntimeBridgeTests(unittest.TestCase):
             rollout.write_text(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
             self.assertEqual(bridge.inventory(ledger, db, "", datetime.now(timezone.utc))["tasks"][0]["status"], "blocked")
 
+    def test_inventory_sees_committed_wal_row_without_writing_source_catalog(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            db = root / "state.db"
+            rollout = root / "rollout.jsonl"
+            rollout.write_text(json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}) + "\n")
+            writer = sqlite3.connect(db)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE threads(id TEXT, rollout_path TEXT)")
+                writer.commit()
+                writer.execute("INSERT INTO threads VALUES(?, ?)", (TASK, str(rollout)))
+                writer.commit()
+                before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in root.iterdir()}
+                result = bridge.inventory({"objectives": [objective(coding_task_id=TASK)]},
+                                          db, "", datetime.now(timezone.utc))
+                self.assertEqual(result["tasks"], [{"id": TASK, "status": "completed"}])
+                self.assertEqual({path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in root.iterdir()}, before)
+            finally:
+                writer.close()
+
     def test_pr_discovery_is_explicit_and_ambiguous_reference_fails_closed(self):
         ledger = {"objectives": [objective(), objective(604)]}
         cases = [
@@ -69,6 +91,7 @@ class RuntimeBridgeTests(unittest.TestCase):
             ("Fixes #523", "work", "feature", [("#523", 603)], False),
             ("Implements the approved scope of #523", "Implement #523", "codex/523-feature", [("#523", 603)], False),
             ("Closes #523\nCloses #604", "work", "feature", [], True),
+            ("Closes #523\nCloses #604", "Fix #523", "codex/523-feature", [], True),
             ("Closes #523", "Implement #604", "codex/604-feature", [], True),
             ("Closes #523", "Implement #523", "codex/604-feature", [], True),
             ("Closes #523", "Implement #604", "codex/523-feature", [], True),

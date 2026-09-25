@@ -245,6 +245,9 @@ def acknowledge(path, aid, evidence, instant):
             raise ReconcileError("action is absent or superseded; refresh first")
         if record["state"] == "acknowledged" and record.get("evidence") != evidence:
             raise ReconcileError("conflicting acknowledgment")
+        if record["state"] == "acknowledged":
+            # An idempotent retry cannot postpone an unchanged-action alert.
+            return record
         record.update(state="acknowledged", evidence=evidence, acknowledged_at=instant.isoformat())
         atomic_write(path, data)
     return record
