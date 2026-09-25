@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.yichen.boss.learnrise</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/yichen/.codex/skills/boss/scripts/runtime_bridge.py</string>
+    <string>--ledger</string><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/ownership.json</string>
+    <string>--audit</string><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/audit.py</string>
+    <string>--state-db</string><string>/Users/yichen/.codex/state_5.sqlite</string>
+    <string>--tasks</string><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/codex-tasks.json</string>
+    <string>--outbox</string><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/boss-action-outbox.json</string>
+    <string>--hub-task</string><string>01a0d565-c171-7120-b828-b04db384021f</string>
+  </array>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/boss-runtime.stdout.log</string>
+  <key>StandardErrorPath</key><string>/Users/yichen/agents-artifacts/learnrise-orchestrator/boss-runtime.stderr.log</string>
+</dict></plist>
