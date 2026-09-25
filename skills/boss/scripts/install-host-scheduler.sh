@@ -41,19 +41,19 @@ if [ "$MODE" != "stop" ] && { [ ! -x "$SKILL_PATH/scripts/scheduler.py" ] || [ !
   exit 2
 fi
 
-resolve_gh() {
+resolve_executable() {
+  local name="$1"
   local candidate
-  candidate="$(type -P gh 2>/dev/null || true)"
+  candidate="$(type -P "$name" 2>/dev/null || true)"
   if [ -z "$candidate" ]; then
-    echo "boss scheduler: cannot find the gh executable on the installer PATH" >&2
+    echo "boss scheduler: cannot find the $name executable on the installer PATH" >&2
     return 1
   fi
   if [[ "$candidate" != /* || "$candidate" == *$'\n'* || "$candidate" == *$'\r'* || "$candidate" == *:* ]] || [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; then
-    echo "boss scheduler: gh resolved to an invalid or non-executable path: $candidate" >&2
+    echo "boss scheduler: $name resolved to an invalid or non-executable path: $candidate" >&2
     return 1
   fi
-  GH_BIN="$candidate"
-  GH_DIR="${candidate%/*}"
+  printf '%s' "$candidate"
 }
 
 xml_escape() {
@@ -99,12 +99,24 @@ if [ "$MODE" = "stop" ]; then
   exit 0
 fi
 
-if ! resolve_gh; then
+if ! GH_BIN="$(resolve_executable gh)"; then
   exit 2
 fi
+if ! CODEX_BIN="$(resolve_executable codex)"; then
+  exit 2
+fi
+GH_DIR="${GH_BIN%/*}"
+CODEX_DIR="${CODEX_BIN%/*}"
 # launchd does not inherit the user's interactive PATH. Keep the system tool
-# directories and only the directory containing the validated gh executable.
-LAUNCH_PATH_XML="$(xml_escape "/usr/bin:/bin:/usr/sbin:/sbin:$GH_DIR")"
+# directories and only the directories containing validated gh and codex.
+LAUNCH_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+for tool_dir in "$GH_DIR" "$CODEX_DIR"; do
+  case ":$LAUNCH_PATH:" in
+    *":$tool_dir:"*) ;;
+    *) LAUNCH_PATH="$LAUNCH_PATH:$tool_dir" ;;
+  esac
+done
+LAUNCH_PATH_XML="$(xml_escape "$LAUNCH_PATH")"
 
 mkdir -p "$AGENTS_DIR" "$STATE_DIR"
 bootout_if_loaded "$LABEL"
