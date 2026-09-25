@@ -534,10 +534,15 @@ def main():
                     fail("adapter must be an absolute executable file")
                 if not args.phase or not args.owner or not args.generation or args.generation <= 0:
                     fail("ticket launch --apply requires --phase, --owner, and the active claim --generation")
-                launched = operational_store(repo, "dispatch", "--issue", str(number), "--phase", args.phase, "--owner", args.owner, "--generation", str(args.generation), "--verb", "launch", "--adapter", str(adapter), "--kind", tickets[key]["kind"], "--master", state["master"])
+                launched = operational_store(repo, "dispatch", "--issue", str(number), "--phase", args.phase, "--owner", args.owner, "--generation", str(args.generation), "--verb", "launch", "--adapter", str(adapter), "--repo-path", str(Path(args.repo).resolve()), "--kind", tickets[key]["kind"], "--master", state["master"])
                 tickets[key].update(status="launched", action_id=launched["action_id"], task_id=launched["task_id"], launched_at=iso(now()))
+                if launched.get("url"):
+                    tickets[key]["task_url"] = launched["url"]
                 save(path, state)
-        print(json.dumps({"issue": number, "status": tickets[key]["status"]}))
+        result = {"issue": number, "status": tickets[key]["status"]}
+        if tickets[key].get("task_url"):
+            result["task_url"] = tickets[key]["task_url"]
+        print(json.dumps(result))
         return
     if args.command == "monitor":
         name = identifier(args.name, "monitor name")

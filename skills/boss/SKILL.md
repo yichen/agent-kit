@@ -88,12 +88,37 @@ head, current-head independent review, repository merge rules, and human gates
 before deciding whether any merge is allowed. The script's `passed_count` is
 only a signal to inspect; it is never proof that required contexts passed.
 
-No universal CLI adapter for the Codex task API is installed by this skill.
-In particular, LearnRise's `learnrise-code-exec` runs a coding turn
-synchronously and cannot serve as the existing `/boss` launch adapter, which
-expects a task ID within 120 seconds. Do not claim autonomous dispatch until
-the host has a tested asynchronous worker that consumes this outbox,
-deduplicates by action ID, records the real task ID, and acknowledges it.
+LearnRise's `learnrise-code-exec` runs a coding turn synchronously and cannot
+serve as the existing `/boss` launch adapter, which expects a task ID within
+120 seconds. The checked-in Codex adapter below provides the asynchronous
+worker integration when an app-server is already running. Do not claim the
+host is autonomous until the app-server launch canary, #18 shadow comparison,
+and pilot pass.
+
+`scripts/codex_worker_adapter.py` is the local Codex worker adapter for
+`ticket launch --apply`. It connects only to an already running managed
+app-server through `codex app-server proxy`; it never starts or restarts a
+daemon. Launch checks that the issue is open, no open PR already references
+it, the source checkout is clean, and its GitHub default branch can be freshly
+fetched, and that the GitHub account has write access. It creates and verifies
+a sibling worktree and a stable action branch,
+then starts one visible Codex thread with `on-request` approvals and
+`workspace-write` sandboxing. Its `threadSource` records the SQLite action ID,
+so a retry or a caller crash can recover the same real task UUID and
+`codex://threads/<UUID>` link instead of starting another task. An uncertain
+timeout leaves the action reserved; inspect the `inventory` operation before
+any retry.
+
+The read-only `inventory` operation uses `thread/list` with state-DB-only
+enumeration and reads tagged tasks with `thread/read`; it does not initialize
+or start an app-server daemon. It reports approval/user-input waits as
+`blocked`. `resume` requires both the exact action ID and exact task UUID,
+checks current app-server status and local writer processes, refuses an
+active task or any live writer, and resumes only its verified worktree. If the
+app-server socket is unavailable, launch, inventory, and resume fail closed.
+Do not report task setup complete while only a pending client ID is known.
+Per-action locks serialize retries and resumes; a per-issue lock prevents
+different action IDs from racing to launch duplicate workers.
 
 ### Host runtime bridge
 
