@@ -216,7 +216,8 @@ def pr_actions(repo, pr, linked, instant):
     return actions
 
 
-def report(state, inventory, instant):
+def report(state, inventory, instant, operational=None, source_errors=None):
+    errors = source_errors or {}
     tickets = state["tickets"]
     linked = {number: ticket for ticket in tickets.values() for number in ticket["prs"]}
     open_prs = [pr for pr in inventory if pr["state"] == "OPEN"]
@@ -233,7 +234,13 @@ def report(state, inventory, instant):
     actions = [action for pr in open_prs for action in pr_actions(state["repo"], pr, pr["number"] in linked, instant)]
     monitor = state["monitor"]
     last = monitor.get("last_scan_at")
-    age = (instant - parse_time(last)).total_seconds() / 60 if last else None
+    try:
+        age = (instant - parse_time(last)).total_seconds() / 60 if last else None
+        if age is not None and age < -1:
+            raise ValueError("last scan timestamp is in the future")
+    except ValueError as exc:
+        age = None
+        errors["scan"] = str(exc)
     health = "unconfigured" if not monitor.get("name") else "unverified"
     hourly = []
     for offset in range(5, 0, -1):
@@ -241,19 +248,83 @@ def report(state, inventory, instant):
         end = start + dt.timedelta(hours=1)
         hourly.append({"start": iso(start), "created": [pr["number"] for pr in recent_created if start <= parse_time(pr["createdAt"]) < end], "merged": [pr["number"] for pr in recent_merged if start <= parse_time(pr["mergedAt"]) < end]})
     waiting = {key: [dep for dep in ticket["depends"] if tickets[str(dep)]["status"] != "resolved"] for key, ticket in tickets.items() if ticket["status"] == "ready"}
+    claims = {}
+    for row in (operational or {}).get("active_claims", []):
+        claims.setdefault(row["issue"], []).append(row)
+    action_rows = (operational or {}).get("actions", [])
+    latest_action = {}
+    for action in action_rows:
+        latest_action[action["issue"]] = action
+    latest_events = {}
+    for event in (operational or {}).get("latest_events", []):
+        latest_events.setdefault(event["issue"], event)
+    pr_report = []
+    for pr in open_prs:
+        ticket = linked.get(pr["number"])
+        issue = ticket["issue"] if ticket else None
+        issue_claims = sorted(claims.get(issue, []), key=lambda row: row["acquired_at"]) if issue is not None else []
+        claim = issue_claims[-1] if issue_claims else None
+        action = latest_action.get(issue) if issue is not None else None
+        blocker = next((item["blocker"] for item in actions if item["pr"] == pr["number"]), None)
+        task_id = action.get("task_id") if action else None
+        pr_report.append({
+            **pr,
+            "issue": issue or "unknown",
+            "owner": claim.get("owner") if claim else action.get("owner") if action else "unknown",
+            "phase": claim.get("phase") if claim else action.get("phase") if action else "unknown",
+            "session_id": task_id or "unknown",
+            "session_link": f"codex://threads/{task_id}" if task_id else "unknown",
+            "blocker": blocker or "unknown",
+            "dependency": ticket["depends"] if ticket else "unknown",
+            "human_gate": ticket.get("human_gate", "unknown") if ticket else "unknown",
+            "last_meaningful_action": ({"kind": action["status"], "at": action.get("verified_at") or action.get("acknowledged_at") or action.get("reserved_at"), "action_id": action["action_id"]} if action else "unknown"),
+        })
+    tickets_report = []
+    for ticket in tickets.values():
+        issue = ticket["issue"]
+        issue_claims = sorted(claims.get(issue, []), key=lambda row: row["acquired_at"])
+        claim = issue_claims[-1] if issue_claims else None
+        action = latest_action.get(issue)
+        linked_prs = [pr for pr in inventory if pr["number"] in ticket["prs"]]
+        blocker = next((item["blocker"] for item in actions if item["pr"] in ticket["prs"]), None)
+        waiting_for = [dep for dep in ticket["depends"] if tickets[str(dep)]["status"] != "resolved"]
+        task_id = action.get("task_id") if action else ticket.get("task_id")
+        tickets_report.append({
+            **ticket,
+            "owner": claim.get("owner") if claim else action.get("owner") if action else "unknown",
+            "phase": claim.get("phase") if claim else action.get("phase") if action else "unknown",
+            "active_claims": issue_claims if "claim_store" not in errors else "unknown",
+            "session_id": task_id or "unknown",
+            "session_link": f"codex://threads/{task_id}" if task_id else "unknown",
+            "blocker": blocker or ("unresolved dependencies: " + ",".join(map(str, waiting_for)) if waiting_for else "unknown"),
+            "dependency": ticket["depends"] or [],
+            "last_meaningful_action": ({"kind": action["status"], "at": action.get("verified_at") or action.get("acknowledged_at") or action.get("reserved_at"), "action_id": action["action_id"]} if action else ({key: event.get(key) for key in ("kind", "at", "phase", "action_id")} if (event := latest_events.get(issue)) else "unknown")),
+            "pull_requests": linked_prs if "github" not in errors else "unknown",
+        })
+    resolved_by_kind = {kind: sum(1 for ticket in resolved if ticket["kind"] == kind) for kind in ("feature", "testability")}
+    scan_error = errors.get("scan") or ("last successful scan is older than 15 minutes" if last and age is not None and age > 15 else None)
+    freshness = {
+        "github": {"status": "fresh" if inventory is not None and "github" not in errors else "unknown", "checked_at": iso(instant), "error": errors.get("github")},
+        "claim_store": {"status": "fresh" if operational is not None and "claim_store" not in errors else "unknown", "checked_at": iso(instant), "error": errors.get("claim_store")},
+        "scan": {"status": "fresh" if last and scan_error is None else "unknown", "last_success_at": last if age is not None else "unknown", "age_minutes": age if age is not None else "unknown", "checked_at": iso(instant), "error": scan_error or ("no successful scan recorded" if not last else None)},
+        "last_scan_at": last if age is not None else "unknown", "last_scan_age_minutes": age if age is not None else "unknown",
+    }
     return {
+        "as_of": iso(instant), "source_errors": errors, "freshness": freshness,
         "repo": state["repo"], "master": state["master"], "hub": state.get("hub"),
+        "tickets": tickets_report,
         "active_tickets": [ticket for ticket in tickets.values() if ticket["status"] != "resolved"],
-        "open_prs": open_prs, "unlinked_open_prs": [pr["number"] for pr in open_prs if pr["number"] not in linked],
-        "pr_actions": actions,
-        "merged_5h": {"total": len(recent_merged), "numbers": [pr["number"] for pr in recent_merged], **counts},
-        "merged_features_5h": merged_features,
+        "open_prs": pr_report if "github" not in errors else "unknown", "unlinked_open_prs": [pr["number"] for pr in open_prs if pr["number"] not in linked] if "github" not in errors else "unknown",
+        "pr_actions": actions if "github" not in errors else "unknown",
+        "merged_5h": ({"total": len(recent_merged), "numbers": [pr["number"] for pr in recent_merged], **counts} if "github" not in errors else "unknown"),
+        "merged_features_5h": merged_features if "github" not in errors else "unknown",
         "human_decisions": [{"issue": ticket["issue"], "gate": ticket.get("human_gate", "unknown")} for ticket in tickets.values() if ticket["status"] != "resolved" and ticket.get("human_gate", "unknown") != "unknown"],
-        "created_5h": [pr["number"] for pr in recent_created], "hourly_5h": hourly,
+        "created_5h": [pr["number"] for pr in recent_created] if "github" not in errors else "unknown", "hourly_5h": hourly if "github" not in errors else "unknown",
         "dependency_waits": {key: deps for key, deps in waiting.items() if deps},
         "resolved_24h": resolved,
+        "resolved_metrics_24h": {"total": len(resolved), "numbers": [item["issue"] for item in resolved], **resolved_by_kind},
         "resolved_actions_24h": [item for item in state.get("action_history", {}).values() if item.get("status") == "resolved" and parse_time(item["resolved_at"]) >= instant - dt.timedelta(hours=24)],
-        "monitor": {"name": monitor.get("name"), "last_scan_at": last, "last_scan_age_minutes": age, "health": health},
+        "monitor": {"name": monitor.get("name"), "last_scan_at": last if age is not None else "unknown", "last_scan_age_minutes": age if age is not None else "unknown", "health": health},
     }
 
 
@@ -261,8 +332,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prs-file", help="local test fixture; never use for live reporting")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("init", "adopt", "status", "scan", "doctor", "handoff", "reconcile"):
-        sub.add_parser(name).add_argument("--repo", required=True)
+    for name in ("init", "adopt", "status", "metrics", "scan", "doctor", "handoff", "reconcile"):
+        command_parser = sub.add_parser(name)
+        command_parser.add_argument("--repo", required=True)
+        if name in ("status", "metrics"):
+            command_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     sub.choices["init"].add_argument("--master", required=True)
     sub.choices["init"].add_argument("--hub")
     sub.choices["adopt"].add_argument("--master", required=True)
@@ -302,11 +376,52 @@ def main():
     msub = monitor.add_subparsers(dest="action", required=True)
     msub.add_parser("set").add_argument("--repo", required=True)
     msub.choices["set"].add_argument("--name", required=True)
+    history = sub.add_parser("history")
+    history.add_argument("item", help="issue number, PR number, task ID, or action ID")
+    history.add_argument("--repo", required=True)
+    history.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     args = parser.parse_args()
     if args.prs_file and os.environ.get("BOSS_TEST_MODE") != "1":
         fail("--prs-file is available only in explicit local test mode")
     repo = repo_path(args.repo)
     path = state_path(repo)
+    if args.command == "history":
+        with locked(path) as state:
+            require(state, repo)
+            item = args.item.removeprefix("#")
+            numeric = int(item) if item.isdecimal() else None
+            issue = numeric if str(numeric) in state["tickets"] else None
+            matching_tickets = [ticket for ticket in state["tickets"].values() if ticket["issue"] == issue] if issue is not None else [ticket for ticket in state["tickets"].values() if numeric is not None and numeric in ticket["prs"]]
+            if issue is None and matching_tickets:
+                issue = matching_tickets[0]["issue"]
+            try:
+                events = operational_store(repo, "history", "--issue", str(issue)) if issue is not None else operational_store(repo, "history")
+            except (ValueError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+                result = {"item": args.item, "events": "unknown", "pr_actions": "unknown", "as_of": iso(now()), "source": {"status": "unknown", "error": str(exc), "checked_at": iso(now())}}
+            else:
+                def exact_event_match(event, value):
+                    if value in (event.get("action_id"), event.get("phase")):
+                        return True
+                    try:
+                        details = json.loads(event.get("details") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        return False
+                    def contains_exact(node):
+                        if isinstance(node, dict):
+                            return any(child == value or contains_exact(child) for child in node.values())
+                        if isinstance(node, list):
+                            return any(contains_exact(child) for child in node)
+                        return False
+                    return contains_exact(details)
+
+                matches = [event for event in events if issue is not None or exact_event_match(event, item)]
+                ticket_prs = {pr for ticket in matching_tickets for pr in ticket["prs"]}
+                if numeric is not None and not matching_tickets:
+                    ticket_prs.add(numeric)
+                pr_history = [entry for entry in state.get("action_history", {}).values() if entry.get("pr") in ticket_prs]
+                result = {"item": args.item, "events": matches, "pr_actions": pr_history, "as_of": iso(now()), "source": {"status": "fresh", "checked_at": iso(now()), "error": None}}
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     if args.command == "init":
         master = identifier(args.master, "master")
         hub = identifier(args.hub, "hub") if args.hub else None
@@ -432,10 +547,26 @@ def main():
         return
     with locked(path, write=args.command == "scan") as state:
         require(state, repo)
-        inventory = prs(args, repo)
+        source_errors = {}
+        inventory = None
+        operational = None
+        try:
+            inventory = prs(args, repo)
+        except (ValueError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            if args.command == "scan":
+                raise
+            source_errors["github"] = str(exc)
+        try:
+            operational = operational_store(repo, "status")
+        except (ValueError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            source_errors["claim_store"] = str(exc)
+        if inventory is None:
+            inventory = []
+        if operational is None:
+            operational = {}
         if args.command == "scan":
             instant = now()
-            current = report(state, inventory, instant)["pr_actions"]
+            current = report(state, inventory, instant, operational, source_errors)["pr_actions"]
             current_ids = {item["id"] for item in current}
             history = state.setdefault("action_history", {})
             for item in current:
@@ -447,7 +578,9 @@ def main():
                     record.update(status="resolved", resolved_at=iso(instant))
             state["monitor"]["last_scan_at"] = iso(instant)
             save(path, state)
-        result = report(state, inventory, now())
+        result = report(state, inventory, now(), operational, source_errors)
+    if args.command == "metrics":
+        result = {key: result[key] for key in ("as_of", "freshness", "source_errors", "created_5h", "hourly_5h", "merged_5h", "merged_features_5h", "resolved_24h", "resolved_metrics_24h", "resolved_actions_24h")}
     if args.command == "doctor":
         result = {"repo": github_repo(repo), "monitor": result["monitor"], "pr_actions": result["pr_actions"], "healthy": result["monitor"]["health"] == "healthy" and not result["pr_actions"]}
     if args.command == "reconcile":

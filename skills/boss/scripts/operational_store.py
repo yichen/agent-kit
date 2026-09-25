@@ -523,7 +523,8 @@ def main():
             query += " ORDER BY sequence"
             result = [dict(row) for row in con.execute(query, params)]
         else:
-            result = {"repo": repo, "active_claims": [dict(row) for row in con.execute("SELECT issue,phase,generation,owner,acquired_at FROM claims WHERE repo=? AND status='active' ORDER BY issue,phase", (repo,))], "actions": [dict(row) for row in con.execute("SELECT action_id,issue,phase,verb,attempt,generation,owner,status,task_id,reserved_at,acknowledged_at,verified_at,last_scan_at,last_effect FROM actions WHERE repo=? ORDER BY reserved_at", (repo,))]}
+            events = [dict(row) for row in con.execute("SELECT issue,phase,action_id,kind,at,details FROM events WHERE repo=? AND issue IS NOT NULL ORDER BY sequence DESC LIMIT 500", (repo,))]
+            result = {"repo": repo, "active_claims": [dict(row) for row in con.execute("SELECT issue,phase,generation,owner,acquired_at FROM claims WHERE repo=? AND status='active' ORDER BY issue,phase", (repo,))], "actions": [dict(row) for row in con.execute("SELECT action_id,issue,phase,verb,attempt,generation,owner,status,task_id,reserved_at,acknowledged_at,verified_at,last_scan_at,last_effect FROM actions WHERE repo=? ORDER BY reserved_at", (repo,))], "latest_events": events}
         print(json.dumps(result, sort_keys=True))
     finally:
         con.close()

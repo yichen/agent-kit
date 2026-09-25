@@ -90,7 +90,10 @@ expect_ops_fail() {
   grep -q "$expected" "$ROOT/err"
 }
 GEN2="$(ops claim --issue 2 --phase implement --owner boss-A | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
+ops claim --issue 2 --phase review --owner reviewer-A > /dev/null
 state_before="$(shasum -a 256 "$STATE")"
+DB="$AGENTS_ARTIFACTS_ROOT/boss/operations.sqlite3"
+db_before="$(shasum -a 256 "$DB")"
 run ticket launch --repo "$REPO" --issue 2 --adapter "$ADAPTER" > "$ROOT/preview"
 test ! -e "$BOSS_TEST_REQUEST"
 test "$state_before" = "$(shasum -a 256 "$STATE")"
@@ -106,7 +109,15 @@ assert data['unlinked_open_prs']==[11]
 assert len(data['resolved_24h'])==1
 assert sum(len(row['merged']) for row in data['hourly_5h'])==1
 assert data['created_5h']==[11,12]
+assert data['resolved_metrics_24h']=={'total':1,'numbers':[1],'feature':1,'testability':0}
 assert data['merged_features_5h']==[{'issue':1,'pr':12,'summary':'Reading practice','availability':'testable','test_environment':'staging iPad','human_gate':'Parent acceptance required'}]
+ticket=next(row for row in data['tickets'] if row['issue']==2)
+assert ticket['owner']=='reviewer-A' and ticket['phase']=='review'
+assert {(claim['owner'],claim['phase']) for claim in ticket['active_claims']}=={('boss-A','implement'),('reviewer-A','review')}
+assert ticket['session_id']=='unknown' and ticket['session_link']=='unknown'
+assert ticket['dependency']==[1] and ticket['human_gate']=='unknown'
+assert ticket['pull_requests']==[]
+assert data['freshness']['github']['status']=='fresh'
 PY
 
 expect_fail 'absolute executable' ticket launch --repo "$REPO" --issue 2 --adapter 'sh;touch-owned' --apply --phase implement --owner boss-A --generation "$GEN2"
@@ -180,6 +191,12 @@ import json,sys
 data=json.load(open(sys.argv[1]))
 assert data['merged_5h']['feature']==1
 assert data['unlinked_open_prs']==[]
+ticket=next(row for row in data['tickets'] if row['issue']==2)
+assert ticket['session_id']=='task-2' and ticket['session_link']=='codex://threads/task-2'
+assert [pr['number'] for pr in ticket['pull_requests']]==[11]
+pr=next(row for row in data['open_prs'] if row['number']==11)
+assert pr['owner']=='reviewer-A' and pr['phase']=='review'
+assert pr['session_id']=='task-2' and pr['human_gate']=='unknown'
 PY
 
 # Failed inventory leaves the scan timestamp and state untouched.
@@ -223,6 +240,69 @@ state_before="$(shasum -a 256 "$STATE")"
 PATH="$MOCK_BIN:$PATH" python3 "$BOSS" status --repo "$REPO" > /dev/null
 test "$state_before" = "$(shasum -a 256 "$STATE")"
 test "$(cat "$BOSS_GH_CALLS")" = 'pr list --repo example/project --state all --limit 500 --json number,state,createdAt,updatedAt,mergedAt,url,title,headRefOid,mergeable,reviewDecision,statusCheckRollup,isDraft'
+cat > "$MOCK_BIN/gh" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$*" >> "$BOSS_GH_CALLS"
+if [ "$1" != pr ] || [ "$2" != list ]; then
+  printf '%s\n' 'unexpected GitHub operation' >&2
+  exit 91
+fi
+printf '%s\n' 'offline' >&2
+exit 1
+SH
+chmod +x "$MOCK_BIN/gh"
+PATH="$MOCK_BIN:$PATH" python3 "$BOSS" status --repo "$REPO" --json > "$ROOT/unavailable-status"
+python3 - "$ROOT/unavailable-status" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1]))
+assert data['open_prs']=='unknown' and data['merged_5h']=='unknown'
+assert data['freshness']['github']['status']=='unknown'
+assert data['freshness']['github']['error'] and data['freshness']['github']['checked_at']
+assert next(row for row in data['tickets'] if row['issue']==2)['pull_requests']=='unknown'
+assert data['merged_features_5h']=='unknown'
+PY
+
+# Status/history canary: all persistent artifacts remain byte-identical; only the
+# expected GitHub read is allowed. Any session wake, scheduler, or HTTP client call
+# leaves a marker and fails the canary.
+for forbidden in curl launchctl codex; do
+  cat > "$MOCK_BIN/$forbidden" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$0 $*" >> "$BOSS_FORBIDDEN_CALLS"
+exit 91
+SH
+  chmod +x "$MOCK_BIN/$forbidden"
+done
+export BOSS_FORBIDDEN_CALLS="$ROOT/forbidden-calls"
+state_before="$(shasum -a 256 "$STATE")"
+db_before="$(shasum -a 256 "$DB")"
+before_artifacts="$(find "$AGENTS_ARTIFACTS_ROOT" -print | sort; find "$AGENTS_ARTIFACTS_ROOT" -type f -exec shasum -a 256 {} \; | sort)"
+PATH="$MOCK_BIN:$PATH" python3 "$BOSS" status --repo "$REPO" --json > /dev/null
+PATH="$MOCK_BIN:$PATH" python3 "$BOSS" metrics --repo "$REPO" --json > "$ROOT/metrics"
+PATH="$MOCK_BIN:$PATH" python3 "$BOSS" history 2 --repo "$REPO" --json > "$ROOT/history"
+PATH="$MOCK_BIN:$PATH" python3 "$BOSS" history task-2 --repo "$REPO" --json > "$ROOT/task-history"
+PATH="$MOCK_BIN:$PATH" python3 "$BOSS" history missing-task-xyz --repo "$REPO" --json > "$ROOT/empty-history"
+after_artifacts="$(find "$AGENTS_ARTIFACTS_ROOT" -print | sort; find "$AGENTS_ARTIFACTS_ROOT" -type f -exec shasum -a 256 {} \; | sort)"
+test "$before_artifacts" = "$after_artifacts"
+test ! -e "$BOSS_FORBIDDEN_CALLS"
+test "$db_before" = "$(shasum -a 256 "$DB")"
+test "$state_before" = "$(shasum -a 256 "$STATE")"
+python3 - "$ROOT/history" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1]))
+assert data['item']=='2' and data['events'] and data['source']['status']=='fresh'
+PY
+python3 - "$ROOT/metrics" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1]))
+assert data['merged_5h']=='unknown' and data['freshness']['github']['status']=='unknown'
+PY
+python3 - "$ROOT/task-history" "$ROOT/empty-history" <<'PY'
+import json,sys
+task,missing=[json.load(open(path)) for path in sys.argv[1:]]
+assert any(event['kind']=='action_acknowledged' for event in task['events'])
+assert missing['events']==[] and missing['pr_actions']==[]
+PY
 
 # Table-driven PR classification: head, CI, conflict, review, and malformed input.
 python3 - "$BOSS" <<'PY'
