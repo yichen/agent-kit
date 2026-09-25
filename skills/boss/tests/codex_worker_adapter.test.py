@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import base64
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -64,54 +68,142 @@ class FakeServer:
         raise AssertionError(f"unexpected mutating RPC {method}")
 
 
-class FakeRpcProcess:
-    def __init__(self, mode="normal", **_kwargs):
-        self.mode = mode
-        request_read, request_write = os.pipe()
-        response_read, response_write = os.pipe()
-        self.stdin = os.fdopen(request_write, "w", buffering=1)
-        self.stdout = os.fdopen(response_read, "rb", buffering=0)
-        self.stderr = io.StringIO()
-        self.exit_code = None
-        self.thread = threading.Thread(target=self.serve, args=(request_read, response_write), daemon=True)
+def websocket_frame(opcode, payload=b"", *, final=True, masked=False, reserved=0):
+    payload = bytes(payload)
+    first = (0x80 if final else 0) | reserved | opcode
+    size = len(payload)
+    mask_bit = 0x80 if masked else 0
+    if size < 126:
+        header = bytes((first, mask_bit | size))
+    elif size <= 0xFFFF:
+        header = bytes((first, mask_bit | 126)) + struct.pack("!H", size)
+    else:
+        header = bytes((first, mask_bit | 127)) + struct.pack("!Q", size)
+    if not masked:
+        return header + payload
+    key = b"test"
+    return header + key + bytes(value ^ key[index & 3] for index, value in enumerate(payload))
+
+
+def read_socket_exact(connection, length):
+    parts = bytearray()
+    while len(parts) < length:
+        chunk = connection.recv(length - len(parts))
+        if not chunk:
+            raise ConnectionError("peer closed")
+        parts.extend(chunk)
+    return bytes(parts)
+
+
+class FakeUnixWebSocketPeer:
+    """Local AF_UNIX WebSocket peer that verifies masked client frames."""
+
+    def __init__(self, socket_path, response_factory, *, handshake_mode="valid"):
+        self.socket_path = Path(socket_path)
+        self.response_factory = response_factory
+        self.handshake_mode = handshake_mode
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.socket_path))
+        self.listener.listen(1)
+        self.requests = []
+        self.client_frames_masked = True
+        self.handshake_request = b""
+        self.failure = None
+        self.connection = None
+        self.thread = threading.Thread(target=self.serve, daemon=True)
         self.thread.start()
 
-    def serve(self, request_fd, response_fd):
-        code = 0
+    def _read_headers(self):
+        data = bytearray()
+        while b"\r\n\r\n" not in data:
+            chunk = self.connection.recv(4096)
+            if not chunk:
+                raise ConnectionError("closed during HTTP handshake")
+            data.extend(chunk)
+            if len(data) > 16 * 1024:
+                raise AssertionError("oversized client handshake")
+        return bytes(data)
+
+    def _read_client_frame(self):
+        first, second = read_socket_exact(self.connection, 2)
+        final, opcode = bool(first & 0x80), first & 0x0F
+        masked = bool(second & 0x80)
+        self.client_frames_masked &= masked
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", read_socket_exact(self.connection, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", read_socket_exact(self.connection, 8))[0]
+        mask = read_socket_exact(self.connection, 4) if masked else b""
+        payload = read_socket_exact(self.connection, length)
+        if masked:
+            payload = bytes(value ^ mask[index & 3] for index, value in enumerate(payload))
+        return final, opcode, payload
+
+    def _send_response(self, headers, key):
+        status = "HTTP/1.1 101 Switching Protocols"
+        upgrade = "Upgrade: websocket\r\n"
+        connection = "Connection: Upgrade"
+        accept = base64.b64encode(hashlib.sha1(key.encode("ascii") + adapter.WEBSOCKET_GUID).digest()).decode("ascii")
+        if self.handshake_mode == "bad_status":
+            status = "HTTP/1.1 403 Forbidden"
+        elif self.handshake_mode == "bad_accept":
+            accept = "incorrect-accept"
+        elif self.handshake_mode == "bad_upgrade":
+            upgrade = "Upgrade: h2c\r\n"
+        elif self.handshake_mode == "duplicate_upgrade":
+            upgrade = "Upgrade: websocket\r\nUpgrade: h2c\r\n"
+        elif self.handshake_mode == "bad_connection":
+            connection = "Connection: keep-alive"
+        self.connection.sendall((f"{status}\r\n{upgrade}{connection}\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode("ascii"))
+
+    def serve(self):
         try:
-            with os.fdopen(request_fd, "rb", buffering=0) as incoming, os.fdopen(response_fd, "wb", buffering=0) as outgoing:
-                for line in incoming:
-                    request = json.loads(line)
-                    if request.get("method") == "initialize":
-                        outgoing.write(b'{"method":"thread/started","params":{}}\n')
-                    elif "id" not in request:
-                        continue
-                    elif self.mode == "timeout":
-                        continue
-                    elif self.mode == "disconnect":
-                        code = 1
-                        return
-                    response = {"id": request["id"], "result": {"data": []}}
-                    outgoing.write(json.dumps(response).encode() + b"\n")
-        except (BrokenPipeError, OSError, json.JSONDecodeError):
-            code = 1
+            self.connection, _ = self.listener.accept()
+            self.connection.settimeout(2)
+            self.handshake_request = self._read_headers()
+            head = self.handshake_request.split(b"\r\n\r\n", 1)[0].decode("ascii")
+            request_lines = head.split("\r\n")
+            headers = {}
+            for line in request_lines[1:]:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+            self._send_response(headers, headers["sec-websocket-key"])
+            if self.handshake_mode != "valid":
+                return
+            while True:
+                final, opcode, payload = self._read_client_frame()
+                if opcode == 0x8:
+                    self.connection.sendall(websocket_frame(0x8, payload))
+                    return
+                if opcode == 0xA:
+                    continue
+                if opcode == 0x9:
+                    self.connection.sendall(websocket_frame(0xA, payload))
+                    continue
+                if opcode != 0x1 or not final:
+                    raise AssertionError("expected a complete masked text request")
+                message = json.loads(payload)
+                self.requests.append(message)
+                frames = self.response_factory(message)
+                if frames == "disconnect":
+                    return
+                for frame in frames or ():
+                    self.connection.sendall(frame)
+        except (OSError, ConnectionError) as exc:
+            self.failure = exc
+        except Exception as exc:
+            self.failure = exc
         finally:
-            self.exit_code = code
+            if self.connection:
+                self.connection.close()
+            self.listener.close()
 
-    def poll(self):
-        return self.exit_code
-
-    def wait(self, timeout=None):
-        self.thread.join(timeout)
+    def join(self):
+        self.thread.join(timeout=3)
         if self.thread.is_alive():
-            raise subprocess.TimeoutExpired("fake-codex-proxy", timeout)
-        return self.exit_code or 0
-
-    def terminate(self):
-        self.exit_code = 1
-
-    def kill(self):
-        self.exit_code = 1
+            self.listener.close()
+            raise AssertionError("fake WebSocket peer did not terminate")
 
 
 def row(task_id=TASK, action_id=ACTION, turn_status="interrupted", **overrides):
@@ -202,21 +294,150 @@ class CodexWorkerAdapterTests(unittest.TestCase):
             writer.wait(timeout=5)
             writer.stdout.close()
 
-    def test_app_server_framing_ignores_notifications_before_response(self):
-        def factory(*_args, **kwargs):
-            return FakeRpcProcess("normal", **kwargs)
-        with mock.patch.object(adapter.shutil, "which", return_value="/codex"), adapter.AppServer(process_factory=factory) as server:
+    def test_app_server_socket_path_resolution_table(self):
+        cases = [
+            ("default home", {}, Path("/home/test"), Path("/home/test/.codex/app-server-control/app-server-control.sock")),
+            ("CODEX_HOME override", {"CODEX_HOME": "/var/tmp/codex"}, Path("/home/test"), Path("/var/tmp/codex/app-server-control/app-server-control.sock")),
+            ("tilde override", {"CODEX_HOME": "~/codex-state"}, Path.home(), Path.home() / "codex-state/app-server-control/app-server-control.sock"),
+        ]
+        for name, environ, home, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(adapter.app_server_socket_path(environ=environ, home=home), expected)
+        with self.assertRaisesRegex(adapter.AdapterError, "CODEX_HOME must be an absolute path"):
+            adapter.app_server_socket_path(environ={"CODEX_HOME": "relative/codex"}, home=Path("/home/test"))
+
+    def test_app_server_handshake_verifies_upgrade_accept_and_headers_table(self):
+        cases = [
+            ("bad status", "bad_status", "upgrade rejected"),
+            ("wrong accept", "bad_accept", "handshake validation failed"),
+            ("wrong upgrade", "bad_upgrade", "handshake validation failed"),
+            ("duplicate upgrade", "duplicate_upgrade", "handshake validation failed"),
+            ("wrong connection", "bad_connection", "handshake validation failed"),
+        ]
+        for name, mode, message in cases:
+            with self.subTest(name=name):
+                peer = FakeUnixWebSocketPeer(self.root / f"{mode}.sock", lambda _request: (), handshake_mode=mode)
+                with self.assertRaisesRegex(adapter.AdapterError, message):
+                    adapter.AppServer(timeout=0.2, socket_path=peer.socket_path)
+                peer.join()
+                self.assertFalse((self.root / "artifacts").exists())
+
+    def test_app_server_websocket_masks_client_frames_and_handles_fragmented_notifications(self):
+        def responses(message):
+            if message["method"] == "initialize":
+                return [websocket_frame(0x1, json.dumps({"id": message["id"], "result": {}}).encode())]
+            if message["method"] == "thread/list":
+                notification = websocket_frame(0x1, b'{"method":"thread/started","params":{}}')
+                response = json.dumps({"id": message["id"], "result": {"data": []}}).encode()
+                split = len(response) // 2
+                return [notification, websocket_frame(0x1, response[:split], final=False),
+                        websocket_frame(0x9, b"ping"), websocket_frame(0x0, response[split:])]
+            return []
+
+        peer = FakeUnixWebSocketPeer(self.root / "app-server.sock", responses)
+        with adapter.AppServer(timeout=0.5, socket_path=peer.socket_path) as server:
             response = server.call("thread/list", {"useStateDbOnly": True})
             self.assertEqual(response, {"data": []})
+        peer.join()
+        self.assertIsNone(peer.failure)
+        self.assertTrue(peer.client_frames_masked)
+        request_text = peer.handshake_request.decode("ascii")
+        self.assertTrue(request_text.startswith("GET / HTTP/1.1\r\n"))
+        headers = {line.split(":", 1)[0].lower(): line.split(":", 1)[1].strip()
+                   for line in request_text.split("\r\n")[1:] if ":" in line}
+        self.assertEqual(headers["upgrade"].lower(), "websocket")
+        self.assertIn("upgrade", headers["connection"].lower())
+        self.assertEqual(headers["sec-websocket-version"], "13")
+        self.assertEqual(len(base64.b64decode(headers["sec-websocket-key"])), 16)
 
-    def test_app_server_timeout_and_connection_loss_fail_closed(self):
-        for mode, message in (("timeout", "timed out"), ("disconnect", "connection closed")):
-            with self.subTest(mode=mode):
-                def factory(*_args, **kwargs):
-                    return FakeRpcProcess(mode, **kwargs)
-                with mock.patch.object(adapter.shutil, "which", return_value="/codex"), adapter.AppServer(timeout=0.05, process_factory=factory) as server:
+    def test_app_server_handles_extended_client_and_server_frame_lengths(self):
+        sizes = (200, 66_000)
+        for size in sizes:
+            with self.subTest(size=size):
+                def responses(message):
+                    if message["method"] == "initialize":
+                        return [websocket_frame(0x1, json.dumps({"id": message["id"], "result": {}}).encode())]
+                    if "id" not in message:
+                        return []
+                    result = {"pad": "x" * size}
+                    return [websocket_frame(0x1, json.dumps({"id": message["id"], "result": result}).encode())]
+
+                peer = FakeUnixWebSocketPeer(self.root / f"large-{size}.sock", responses)
+                with adapter.AppServer(timeout=1, socket_path=peer.socket_path) as server:
+                    result = server.call("thread/list", {"payload": "x" * size})
+                peer.join()
+                self.assertIsNone(peer.failure)
+                self.assertTrue(peer.client_frames_masked)
+                self.assertEqual(len(result["pad"]), size)
+                self.assertEqual(len(peer.requests[-1]["params"]["payload"]), size)
+
+    def test_app_server_rejects_malformed_server_frames_table(self):
+        bad_frames = [
+            ("masked server frame", lambda: websocket_frame(0x1, b"{}", masked=True), "masked server frame"),
+            ("reserved bits", lambda: websocket_frame(0x1, b"{}", reserved=0x40), "reserved bits"),
+            ("oversized frame", lambda: b"\x81\x7f" + struct.pack("!Q", adapter.MAX_WEBSOCKET_MESSAGE_BYTES + 1), "exceeds the size limit"),
+            ("binary message", lambda: websocket_frame(0x2, b"{}"), "binary JSON-RPC"),
+            ("invalid utf8", lambda: websocket_frame(0x1, b"\xff"), "invalid UTF-8"),
+            ("unexpected continuation", lambda: websocket_frame(0x0, b"{}"), "continuation frame"),
+            ("fragmented control", lambda: websocket_frame(0x9, b"x", final=False), "invalid WebSocket control frame"),
+            ("invalid close payload", lambda: websocket_frame(0x8, b"x"), "invalid WebSocket close payload"),
+            ("invalid JSON", lambda: websocket_frame(0x1, b"not json"), "malformed JSON-RPC"),
+        ]
+        for name, make_bad_frame, message in bad_frames:
+            with self.subTest(name=name):
+                def responses(request):
+                    if request["method"] == "initialize":
+                        return [websocket_frame(0x1, json.dumps({"id": request["id"], "result": {}}).encode())]
+                    return [make_bad_frame()]
+
+                peer = FakeUnixWebSocketPeer(self.root / f"bad-{name.replace(' ', '-')}.sock", responses)
+                with adapter.AppServer(timeout=0.5, socket_path=peer.socket_path) as server:
                     with self.assertRaisesRegex(adapter.AdapterError, message):
-                        server.call("thread/list", {"useStateDbOnly": True})
+                        server.call("thread/list", {})
+                peer.join()
+                self.assertFalse((self.root / "artifacts").exists())
+
+    def test_app_server_timeout_and_connection_loss_fail_closed_table(self):
+        cases = [
+            ("timeout", lambda request: [websocket_frame(0x1, json.dumps({"id": request["id"], "result": {}}).encode())]
+             if request["method"] == "initialize" else (), "timed out during thread/list"),
+            ("close during initialize", lambda _request: "disconnect", "connection closed"),
+        ]
+        for name, responses, message in cases:
+            with self.subTest(name=name):
+                peer = FakeUnixWebSocketPeer(self.root / f"failure-{name.replace(' ', '-')}.sock", responses)
+                if name == "timeout":
+                    with adapter.AppServer(timeout=0.05, socket_path=peer.socket_path) as server:
+                        with self.assertRaisesRegex(adapter.AdapterError, message):
+                            server.call("thread/list", {})
+                else:
+                    with self.assertRaisesRegex(adapter.AdapterError, message):
+                        adapter.AppServer(timeout=0.2, socket_path=peer.socket_path)
+                peer.join()
+
+    def test_transport_inventory_is_read_only_and_does_not_initialize_missing_socket(self):
+        def responses(message):
+            if message["method"] == "initialize":
+                return [websocket_frame(0x1, json.dumps({"id": message["id"], "result": {}}).encode())]
+            if message["method"] == "thread/list":
+                return [websocket_frame(0x1, json.dumps({"id": message["id"], "result": {"data": []}}).encode())]
+            return []
+
+        peer = FakeUnixWebSocketPeer(self.root / "inventory.sock", responses)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), adapter.AppServer(timeout=0.5, socket_path=peer.socket_path) as server:
+            adapter.inspect(server)
+        peer.join()
+        methods = [request["method"] for request in peer.requests]
+        self.assertEqual(methods, ["initialize", "initialized", "thread/list"])
+        self.assertEqual(json.loads(out.getvalue())["tasks"], [])
+        self.assertFalse((self.root / "artifacts").exists(), "transport inventory wrote persistent adapter state")
+
+        absent_home = self.root / "absent-codex-home"
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(absent_home)}):
+            with self.assertRaisesRegex(adapter.AdapterError, "cannot connect to Codex app-server socket"):
+                adapter.AppServer(timeout=0.05)
+        self.assertFalse(absent_home.exists(), "connecting to a missing socket created CODEX_HOME")
 
     def test_resume_uses_exact_matching_task_after_live_state_check(self):
         other = row(TASK2, "b" * 64, turn_status="interrupted")
