@@ -60,7 +60,7 @@ completion.
 Each action has a stable `id`, exact repository/objective/issue, task and PR
 identifiers where known, exact current PR head where applicable, and a verb:
 `LAUNCH_TASK`, `RESUME_TASK`, `REPAIR_PR`, `RECOVER_OWNER`,
-`RECONCILE_ISSUE`, `VERIFY_MERGE`, or `QUARANTINE_PR`.
+`RECONCILE_ISSUE`, `VERIFY_REVIEW`, `VERIFY_MERGE`, or `QUARANTINE_PR`.
 The host worker may execute only that verb with its existing task tools and
 authorization checks. After the tool succeeds, run `ack --outbox <absolute-path>
 --id <id> --evidence '<task ID or other concrete result>'`. Acknowledgment is
@@ -82,6 +82,12 @@ required-context list comes from active branch rules and branch protection,
 independent of check results. If no required-check policy is configured, the PR
 stays visible with an owner-recovery action; unrelated PRs and issues continue
 through the same scan.
+Review evidence is collected separately from CI. A `VERIFY_REVIEW` action is
+issued when an independent approval is missing, dismissed, changes requested,
+or attached to an older head. An approval counts only when the latest submitted
+review from someone other than the PR author is approved on the exact current
+head; unfinished pending reviews do not count. The worker gathers and checks
+that evidence only; it cannot grant approval or authorize a merge.
 `VERIFY_MERGE` is an inspection task, **not merge authorization**: the worker
 must independently verify every required CI context on the exact current PR
 head, current-head independent review, repository merge rules, and human gates
