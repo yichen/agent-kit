@@ -28,6 +28,22 @@ def objective(number=523, **updates):
 
 
 class RuntimeBridgeTests(unittest.TestCase):
+    def test_live_pr_inventory_requests_base_branch_without_mutation(self):
+        for repo in ("yichen/LearnRise", "example/project"):
+            with self.subTest(repo=repo):
+                command = bridge.open_pr_inventory_command(repo)
+                self.assertEqual(command[:3], ["gh", "pr", "list"])
+                self.assertEqual(command[command.index("--repo") + 1], repo)
+                fields = command[command.index("--json") + 1].split(",")
+                self.assertIn("baseRefName", fields)
+                self.assertIn("headRefOid", fields)
+                self.assertNotIn("--web", command)
+        for repo in ("", "yichen", "yichen/LearnRise; touch /tmp/owned",
+                     "yichen/LearnRise\n--web", "../LearnRise"):
+            with self.subTest(invalid_repo=repo):
+                with self.assertRaisesRegex(bridge.BridgeError, "invalid ledger repository"):
+                    bridge.open_pr_inventory_command(repo)
+
     def test_sample_scheduler_uses_existing_hub_and_outbox(self):
         sample = SCRIPT.parents[1] / "examples" / "com.yichen.boss.learnrise.plist"
         config = plistlib.loads(sample.read_bytes())
