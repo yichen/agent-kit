@@ -39,12 +39,22 @@ def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=180)
 
 
+def parse_time(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("timezone missing")
+        return parsed.astimezone(UTC)
+    except (AttributeError, ValueError) as exc:
+        raise BridgeError("malformed review timestamp") from exc
+
+
 def open_pr_inventory_command(repo: str) -> list[str]:
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
             or any(part in {".", ".."} for part in repo.split("/"))):
         raise BridgeError("invalid ledger repository")
     return ["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
-            "--json", "number,state,title,body,headRefName,headRefOid,baseRefName,mergeable"]
+            "--json", "number,state,title,body,headRefName,headRefOid,baseRefName,mergeable,author,reviewDecision"]
 
 
 def writer_ids(processes: str) -> set[str]:
@@ -250,7 +260,9 @@ def current_pr_observations(repo: str, ledger: dict, prs: list[dict], additions:
         if fixtures:
             required = pr.get("requiredChecks")
             raw_checks = pr.get("requiredCheckObservations")
+            raw_reviews = pr.get("reviews", [])
             mergeable = pr.get("mergeable")
+            review_decision = pr.get("reviewDecision")
         else:
             if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
                 raise BridgeError(f"PR #{number}: current head missing")
@@ -281,6 +293,29 @@ def current_pr_observations(repo: str, ledger: dict, prs: list[dict], additions:
                 raise BridgeError(f"PR #{number}: head changed during check inventory; retry scan")
             required = required_contexts(repo, pr.get("baseRefName"))
             mergeable = pr.get("mergeable")
+            review_decision = pr.get("reviewDecision")
+            result = run(["gh", "api", "--paginate", "--slurp",
+                          f"repos/{repo}/pulls/{number}/reviews"])
+            if result.returncode:
+                raise BridgeError(f"PR #{number}: review inventory failed: {result.stderr.strip()}")
+            try:
+                raw_reviews = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise BridgeError(f"PR #{number}: malformed review inventory") from exc
+            if (not isinstance(raw_reviews, list) or
+                    any(not isinstance(page, list) for page in raw_reviews)):
+                raise BridgeError(f"PR #{number}: malformed review inventory")
+            raw_reviews = [review for page in raw_reviews for review in page]
+            # Refuse to combine checks and reviews from different heads.
+            verified = run(["gh", "pr", "view", "--repo", repo, str(number), "--json", "headRefOid"])
+            if verified.returncode:
+                raise BridgeError(f"PR #{number}: cannot verify current head after review inventory")
+            try:
+                verified_head = json.loads(verified.stdout).get("headRefOid")
+            except (json.JSONDecodeError, AttributeError) as exc:
+                raise BridgeError(f"PR #{number}: malformed post-review head observation") from exc
+            if verified_head != head:
+                raise BridgeError(f"PR #{number}: head changed during review inventory; retry scan")
         if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
             raise BridgeError(f"PR #{number}: current head missing")
         checks = []
@@ -303,6 +338,40 @@ def current_pr_observations(repo: str, ledger: dict, prs: list[dict], additions:
                     raise BridgeError(f"PR #{number}: unknown required check state")
                 checks.append({"name": check["name"], "head": head, "state": state,
                                "started_at": check.get("startedAt")})
+        author = pr.get("author")
+        if (not isinstance(author, dict) or not isinstance(author.get("login"), str) or
+                not author["login"] or not isinstance(raw_reviews, list)):
+            raise BridgeError(f"PR #{number}: author or review inventory unavailable")
+        latest_reviews = {}
+        for review in raw_reviews:
+            if (not isinstance(review, dict) or not isinstance(review.get("user"), dict) or
+                    not isinstance(review["user"].get("login"), str) or
+                    review.get("state") not in ("PENDING", "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED") or
+                    (review.get("state") != "PENDING" and
+                     (not isinstance(review.get("commit_id"), str) or
+                      not isinstance(review.get("submitted_at"), str)))):
+                raise BridgeError(f"PR #{number}: malformed review evidence")
+            if review["state"] == "PENDING":
+                # Draft reviews are not submitted approval evidence and must
+                # not override the latest submitted review from that reviewer.
+                continue
+            reviewer = review["user"]["login"]
+            submitted_at = parse_time(review["submitted_at"])
+            prior = latest_reviews.get(reviewer)
+            if prior is None or submitted_at > prior["submitted_at"]:
+                latest_reviews[reviewer] = {"state": review["state"], "head": review["commit_id"],
+                                            "submitted_at": submitted_at}
+        independent = [review for reviewer, review in latest_reviews.items() if reviewer != author["login"]]
+        current_approval = next((review for review in independent
+                                 if review["state"] == "APPROVED" and review["head"] == head), None)
+        if any(review["state"] == "CHANGES_REQUESTED" for review in independent) or review_decision == "CHANGES_REQUESTED":
+            review_observation = {"state": "CHANGES_REQUESTED", "head": None}
+        elif current_approval:
+            review_observation = {"state": "APPROVED", "head": head}
+        elif independent:
+            review_observation = {"state": "STALE", "head": max(independent, key=lambda item: item["submitted_at"])["head"]}
+        else:
+            review_observation = {"state": "MISSING", "head": None}
         quarantine = quarantined_by_number.get(number, {})
         observations.append({"number": number, "objective": owners.get(number),
                              "quarantine_reason": quarantine.get("reason"),
@@ -310,7 +379,8 @@ def current_pr_observations(repo: str, ledger: dict, prs: list[dict], additions:
                              "merge": {"MERGEABLE": "CLEAN", "CONFLICTING": "DIRTY"}.get(mergeable, "UNKNOWN"),
                              "observation": {"head": head,
                                              "merge": {"MERGEABLE": "CLEAN", "CONFLICTING": "DIRTY"}.get(mergeable, "UNKNOWN"),
-                                             "required_checks": required or [], "checks": checks}})
+                                             "required_checks": required or [], "checks": checks,
+                                             "review": review_observation}})
     return observations
 
 

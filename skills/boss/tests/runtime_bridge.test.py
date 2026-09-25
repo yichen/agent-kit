@@ -37,6 +37,8 @@ class RuntimeBridgeTests(unittest.TestCase):
                 fields = command[command.index("--json") + 1].split(",")
                 self.assertIn("baseRefName", fields)
                 self.assertIn("headRefOid", fields)
+                self.assertIn("author", fields)
+                self.assertIn("reviewDecision", fields)
                 self.assertNotIn("--web", command)
         for repo in ("", "yichen", "yichen/LearnRise; touch /tmp/owned",
                      "yichen/LearnRise\n--web", "../LearnRise"):
@@ -161,9 +163,13 @@ class RuntimeBridgeTests(unittest.TestCase):
         head = "a" * 40
         pr = {"number": 603, "state": "OPEN", "body": "Closes #523", "title": "Implement #523",
               "headRefName": "codex/523-feature", "headRefOid": head,
-              "baseRefName": "main", "mergeable": "MERGEABLE"}
+              "baseRefName": "main", "mergeable": "MERGEABLE",
+              "author": {"login": "author"}, "reviewDecision": "APPROVED",
+              "reviews": [{"user": {"login": "reviewer"}, "state": "APPROVED",
+                           "commit_id": head, "submitted_at": "2026-09-25T19:00:00Z"}]}
         additions, quarantined = bridge.classify_open_prs(ledger, [pr])
         original_run = bridge.run
+        review_calls = []
 
         def fake_run(command):
             if command[:3] == ["gh", "pr", "checks"]:
@@ -171,6 +177,10 @@ class RuntimeBridgeTests(unittest.TestCase):
                     json.dumps([{"name": "Build", "state": "SUCCESS", "startedAt": None}]), "")
             if command[:3] == ["gh", "pr", "view"]:
                 return subprocess.CompletedProcess(command, 0, json.dumps({"headRefOid": head}), "")
+            if command[:2] == ["gh", "api"] and "/reviews" in command[-1]:
+                review_calls.append(command)
+                return subprocess.CompletedProcess(command, 0, json.dumps([[], [{"user": {"login": "reviewer"},
+                    "state": "APPROVED", "commit_id": head, "submitted_at": "2026-09-25T19:00:00Z"}]]), "")
             if command[1] == "api" and "rules/branches/" in command[2]:
                 return subprocess.CompletedProcess(command, 0, json.dumps([
                     {"type": "required_status_checks", "parameters": {
@@ -188,6 +198,9 @@ class RuntimeBridgeTests(unittest.TestCase):
             bridge.run = original_run
         self.assertEqual(observed[0]["observation"]["required_checks"], ["Build", "Unit tests"])
         self.assertEqual([check["name"] for check in observed[0]["observation"]["checks"]], ["Build"])
+        self.assertEqual(observed[0]["observation"]["review"], {"state": "APPROVED", "head": head})
+        self.assertEqual(review_calls, [["gh", "api", "--paginate", "--slurp",
+                                         "repos/example/project/pulls/603/reviews"]])
 
     def test_absent_required_check_policy_preserves_pr_as_recovery_action(self):
         head = "a" * 40
@@ -195,7 +208,8 @@ class RuntimeBridgeTests(unittest.TestCase):
             objective(pull_requests=[603], pull_request_states={"603": "OPEN"})]}
         pr = {"number": 603, "state": "OPEN", "body": "", "title": "existing PR",
               "headRefName": "codex/523-feature", "headRefOid": head,
-              "baseRefName": "main", "mergeable": "MERGEABLE"}
+              "baseRefName": "main", "mergeable": "MERGEABLE",
+              "author": {"login": "author"}, "reviewDecision": None, "reviews": []}
         original_run = bridge.run
 
         def fake_run(command):
@@ -207,6 +221,8 @@ class RuntimeBridgeTests(unittest.TestCase):
                     json.dumps([{"name": "test", "state": "SUCCESS", "startedAt": None}]), "")
             if command[:3] == ["gh", "pr", "view"]:
                 return subprocess.CompletedProcess(command, 0, json.dumps({"headRefOid": head}), "")
+            if command[:2] == ["gh", "api"] and "/reviews" in command[-1]:
+                return subprocess.CompletedProcess(command, 0, json.dumps([[]]), "")
             if command[1] == "api" and "rules/branches/" in command[2]:
                 return subprocess.CompletedProcess(command, 0, "[]", "")
             if command[1] == "api" and "/protection/required_status_checks" in command[2]:
@@ -252,17 +268,63 @@ class RuntimeBridgeTests(unittest.TestCase):
         ledger = {"objectives": [objective()]}
         pr = {"number": 603, "state": "OPEN", "headRefOid": head,
               "mergeable": "MERGEABLE", "requiredChecks": ["CI"],
-              "requiredCheckObservations": [{"name": "CI", "state": "SUCCESS"}]}
+              "requiredCheckObservations": [{"name": "CI", "state": "SUCCESS"}],
+              "author": {"login": "author"}, "reviewDecision": "APPROVED",
+              "reviews": [{"user": {"login": "author"}, "state": "APPROVED",
+                           "commit_id": head, "submitted_at": "2026-09-25T19:00:00Z"}]}
         additions, quarantined = bridge.classify_open_prs(ledger, [pr])
         observed = bridge.current_pr_observations("example/project", ledger, [pr], additions, quarantined, fixtures=True)
         self.assertEqual(observed[0]["observation"], {
             "head": head, "merge": "CLEAN", "required_checks": ["CI"],
             "checks": [{"name": "CI", "head": head, "state": "SUCCESS", "started_at": None}],
+            "review": {"state": "MISSING", "head": None},
         })
         pr["requiredCheckObservations"][0]["state"] = "$(touch /tmp/owned)"
         with self.assertRaisesRegex(bridge.BridgeError, "unknown required check state"):
             bridge.current_pr_observations("example/project", ledger, [pr], additions, quarantined, fixtures=True)
         self.assertFalse(Path("/tmp/owned").exists())
+
+    def test_review_evidence_requires_independent_approval_on_current_head(self):
+        head, old = "a" * 40, "b" * 40
+        base = {"number": 603, "state": "OPEN", "headRefOid": head, "mergeable": "MERGEABLE",
+                "requiredChecks": ["CI"], "requiredCheckObservations": [{"name": "CI", "state": "SUCCESS"}],
+                "author": {"login": "author"}}
+        stamp = "2026-09-25T18:00:00Z"
+        cases = [
+            ([{"user": {"login": "author"}, "state": "APPROVED", "commit_id": head, "submitted_at": stamp}], "MISSING"),
+            ([{"user": {"login": "reviewer"}, "state": "APPROVED", "commit_id": old, "submitted_at": stamp}], "STALE"),
+            ([{"user": {"login": "reviewer"}, "state": "APPROVED", "commit_id": head, "submitted_at": stamp}], "APPROVED"),
+            ([{"user": {"login": "reviewer"}, "state": "APPROVED", "commit_id": head, "submitted_at": stamp},
+              {"user": {"login": "reviewer"}, "state": "DISMISSED", "commit_id": head, "submitted_at": "2026-09-25T18:01:00Z"}], "STALE"),
+            ([{"user": {"login": "reviewer"}, "state": "CHANGES_REQUESTED", "commit_id": head, "submitted_at": stamp}], "CHANGES_REQUESTED"),
+            ([{"user": {"login": "reviewer"}, "state": "APPROVED", "commit_id": head, "submitted_at": stamp},
+              {"user": {"login": "second-reviewer"}, "state": "CHANGES_REQUESTED", "commit_id": head,
+               "submitted_at": "2026-09-25T18:01:00Z"}], "CHANGES_REQUESTED"),
+            ([{"user": {"login": "reviewer"}, "state": "PENDING", "commit_id": head, "submitted_at": None}], "MISSING"),
+        ]
+        for reviews, expected in cases:
+            with self.subTest(reviews=reviews):
+                additions, quarantined = bridge.classify_open_prs({"objectives": [objective()]}, [base])
+                observed = bridge.current_pr_observations("example/project", {"objectives": [objective()]},
+                    [{**base, "reviews": reviews}], additions, quarantined, fixtures=True)
+                self.assertEqual(observed[0]["observation"]["review"]["state"], expected)
+
+    def test_green_unmerged_pilot_emits_verification_only_and_preserves_human_gate(self):
+        head = "a" * 40
+        pr = {"number": 777, "state": "OPEN", "body": "Closes #523", "title": "Implement #523",
+              "headRefName": "codex/523-feature", "headRefOid": head, "mergeable": "MERGEABLE",
+              "requiredChecks": ["CI"], "requiredCheckObservations": [{"name": "CI", "state": "SUCCESS"}],
+              "author": {"login": "author"}, "reviews": [{"user": {"login": "reviewer"},
+                  "state": "APPROVED", "commit_id": head, "submitted_at": "2026-09-25T18:00:00Z"}]}
+        ledger = {"repository": "example/project", "objectives": [
+            objective(pull_requests=[777], pull_request_states={"777": "OPEN"}, human_gate=True)]}
+        additions, quarantined = bridge.classify_open_prs(ledger, [pr])
+        observations = bridge.current_pr_observations("example/project", ledger, [pr], additions,
+                                                       quarantined, fixtures=True)
+        projected = bridge.project_pr_observations(bridge.project_prs(ledger, additions), observations)
+        actions, waiting = bridge.reconcile.decide(projected, {}, datetime.now(timezone.utc))
+        self.assertEqual([(item["verb"], item["pr"]) for item in actions], [("VERIFY_MERGE", 777)])
+        self.assertEqual(waiting, [{"objective": "#523", "reason": "human_gate", "pr": 777}])
 
     def test_malformed_linked_pr_numbers_fail_before_attachment(self):
         cases = [
@@ -381,7 +443,8 @@ class RuntimeBridgeTests(unittest.TestCase):
             prs.write_text(json.dumps([{"number": 777, "state": "OPEN", "body": "", "title": "old PR",
                                         "headRefName": "misc", "headRefOid": "a" * 40,
                                         "mergeable": "MERGEABLE", "requiredChecks": ["CI"],
-                                        "requiredCheckObservations": [{"name": "CI", "state": "SUCCESS"}]}]))
+                                        "requiredCheckObservations": [{"name": "CI", "state": "SUCCESS"}],
+                                        "author": {"login": "author"}, "reviews": []}]))
             processes.write_text("")
             connection = sqlite3.connect(db)
             connection.execute("CREATE TABLE threads(id TEXT, rollout_path TEXT)")

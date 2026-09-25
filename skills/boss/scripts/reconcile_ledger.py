@@ -172,6 +172,13 @@ def pr_status(repo, row, number, observation, task_id, tasks, now):
     if pending:
         return None, {"objective": rid, "reason": "required_pr_checks_pending", "pr": number,
                       "head": head, "contexts": pending}
+    review = observation.get("review")
+    if not isinstance(review, dict) or review.get("state") not in ("APPROVED", "STALE", "MISSING", "CHANGES_REQUESTED"):
+        return action(repo, row, "RECOVER_OWNER", task_id=task_id, pr=number, head=head,
+                      reason="independent current-head review evidence is unavailable or malformed"), None
+    if review["state"] != "APPROVED" or review.get("head") != head:
+        return action(repo, row, "VERIFY_REVIEW", task_id=task_id, pr=number, head=head,
+                      reason="independent approval for the current PR head is missing, stale, or changes requested"), None
     return action(repo, row, "VERIFY_MERGE", task_id=task_id, pr=number, head=head,
                   reason="verify independent current-head review and repository merge rules; this does not authorize merge"), None
 
@@ -224,6 +231,8 @@ def decide(ledger, tasks, now=None):
                 actions.append(result)
             if wait:
                 waiting.append(wait)
+            if row.get("human_gate") is True:
+                waiting.append({"objective": row["id"], "reason": "human_gate", "pr": number})
         for number, rows_for_pr in owners.items():
             if number not in observed_numbers:
                 actions.append(pr_action(repo, number, "QUARANTINE_PR",
@@ -243,6 +252,8 @@ def decide(ledger, tasks, now=None):
                 actions.append(result)
             if wait:
                 waiting.append(wait)
+            if row.get("human_gate") is True:
+                waiting.append({"objective": row["id"], "reason": "human_gate", "pr": number})
     for row in ledger["objectives"]:
         if not row.get("work_item") or complete(row):
             continue

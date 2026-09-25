@@ -98,7 +98,7 @@ class ReconcileTests(unittest.TestCase):
                        "checks": [
                            {"name": "Focused tooling", "head": "a" * 40, "state": "SUCCESS"},
                            {"name": "Unit tests", "head": "a" * 40, "state": "SUCCESS"},
-                       ]}
+                       ], "review": {"state": "APPROVED", "head": "a" * 40}}
         item = row("#531", coding_task_id=task, pull_requests=[548], pull_request_states={"548": "OPEN"},
                    pr_observations={"548": observation})
         ledger = {"repository": "example/project", "objectives": [item]}
@@ -119,13 +119,14 @@ class ReconcileTests(unittest.TestCase):
                           dispatch_hold={"until": "#999", "reason": "blocked"},
                           coding_task_id=task, pull_requests=[548], pull_request_states={"548": "OPEN"})
         obs = {"head": head, "merge": "CLEAN", "required_checks": ["CI"],
-               "checks": [{"name": "CI", "head": head, "state": "FAILURE"}]}
+               "checks": [{"name": "CI", "head": head, "state": "FAILURE"}],
+               "review": {"state": "APPROVED", "head": head}}
         row_with_pr["pr_observations"] = {"548": obs}
         actions, waits = mod.decide({"repository": "example/project", "objectives": [row_with_pr]},
                                     {task: {"id": task, "status": "running"}})
         self.assertEqual([(item["verb"], item["pr"], item["head"]) for item in actions],
                          [("REPAIR_PR", 548, head)])
-        self.assertEqual(waits, [])
+        self.assertEqual(waits, [{"objective": "#531", "reason": "human_gate", "pr": 548}])
 
     def test_untracked_and_ambiguous_open_prs_are_quarantined_once(self):
         tracked = row("#531", pull_requests=[548], pull_request_states={"548": "OPEN"})
@@ -153,7 +154,8 @@ class ReconcileTests(unittest.TestCase):
         head, other = "a" * 40, "b" * 40
         base = {"head": head, "merge": "CLEAN", "required_checks": ["Build", "Tests"],
                 "checks": [{"name": "Build", "head": head, "state": "SUCCESS"},
-                          {"name": "Tests", "head": head, "state": "SUCCESS"}]}
+                          {"name": "Tests", "head": head, "state": "SUCCESS"}],
+                "review": {"state": "APPROVED", "head": head}}
         item = row("#531", coding_task_id=task, pull_requests=[548], pull_request_states={"548": "OPEN"})
         ledger = {"repository": "example/project", "objectives": [item]}
         tasks = {task: {"id": task, "status": "running"}}
@@ -177,6 +179,27 @@ class ReconcileTests(unittest.TestCase):
                 actions, _ = mod.decide(ledger, tasks, NOW)
                 self.assertEqual(actions[0]["verb"], "RECOVER_OWNER")
         self.assertFalse(Path("/tmp/owned").exists())
+
+    def test_review_gate_is_independent_and_bound_to_exact_head(self):
+        task, head = "01a0d8dc-b312-70d2-ad86-b58088dd22d8", "a" * 40
+        item = row("#531", coding_task_id=task, pull_requests=[548], pull_request_states={"548": "OPEN"})
+        ledger = {"repository": "example/project", "objectives": [item]}
+        tasks = {task: {"id": task, "status": "completed"}}
+        ci = {"head": head, "merge": "CLEAN", "required_checks": ["CI"],
+              "checks": [{"name": "CI", "head": head, "state": "SUCCESS"}]}
+        cases = [
+            ({"state": "MISSING", "head": None}, "VERIFY_REVIEW"),
+            ({"state": "STALE", "head": "b" * 40}, "VERIFY_REVIEW"),
+            ({"state": "CHANGES_REQUESTED", "head": None}, "VERIFY_REVIEW"),
+            ({"state": "APPROVED", "head": "b" * 40}, "VERIFY_REVIEW"),
+            ({"state": "APPROVED", "head": head}, "VERIFY_MERGE"),
+        ]
+        for review, expected in cases:
+            with self.subTest(review=review):
+                item["pr_observations"] = {"548": {**ci, "review": review}}
+                actions, waiting = mod.decide(ledger, tasks, NOW)
+                self.assertEqual([action["verb"] for action in actions], [expected])
+                self.assertEqual(waiting, [])
 
     def test_open_pr_inventory_malformed_inputs_fail_closed(self):
         cases = [[{"number": True}], [{"number": 548}, {"number": 548}], {"number": 548},
@@ -239,6 +262,27 @@ class ReconcileTests(unittest.TestCase):
             for bad in ("bad", "a" * 24):
                 with self.assertRaises(mod.ReconcileError):
                     mod.acknowledge(outbox, bad, "different evidence", NOW)
+
+    def test_review_action_ack_is_checked_against_next_scan_effect(self):
+        with tempfile.TemporaryDirectory() as temp:
+            outbox = Path(temp) / "outbox.json"
+            head = "a" * 40
+            item = row("#531", pull_requests=[548], pull_request_states={"548": "OPEN"},
+                       pr_observations={"548": {"head": head, "merge": "CLEAN", "required_checks": ["CI"],
+                           "checks": [{"name": "CI", "head": head, "state": "SUCCESS"}],
+                           "review": {"state": "STALE", "head": "b" * 40}}})
+            ledger = {"repository": "example/project", "objectives": [item]}
+            action = mod.decide(ledger, {}, NOW)[0][0]
+            self.assertEqual(action["verb"], "VERIFY_REVIEW")
+            mod.sync_outbox(outbox, [action], NOW)
+            mod.acknowledge(outbox, action["id"], "Requested a new review on the current head", NOW)
+            self.assertEqual(mod.sync_outbox(outbox, [action], NOW + timedelta(minutes=16)), [action["id"]])
+            item["pr_observations"]["548"]["review"] = {"state": "APPROVED", "head": head}
+            next_actions = mod.decide(ledger, {}, NOW + timedelta(minutes=17))[0]
+            self.assertEqual([value["verb"] for value in next_actions], ["VERIFY_MERGE"])
+            mod.sync_outbox(outbox, next_actions, NOW + timedelta(minutes=17))
+            recorded = json.loads(outbox.read_text())["actions"]
+            self.assertEqual(recorded[action["id"]]["state"], "resolved")
 
 
 if __name__ == "__main__":
