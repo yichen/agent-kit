@@ -63,6 +63,22 @@ class ReconcileTests(unittest.TestCase):
             self.assertEqual(bool(waits), expected is None)
         self.assertEqual(mod.decide(ledger, {})[0][0]["verb"], "RECOVER_OWNER")
 
+    def test_pending_client_thread_never_launches_duplicate_task(self):
+        for pending in ("client-abc", "$(touch /tmp/owned)"):
+            with self.subTest(pending=pending):
+                ledger = {"repository": "example/project", "objectives": [
+                    row("#506", pending_client_thread_id=pending)]}
+                actions, waits = mod.decide(ledger, {})
+                self.assertEqual(waits, [])
+                self.assertEqual([(a["verb"], a["objective"]) for a in actions],
+                                 [("RECOVER_OWNER", "#506")])
+        for malformed in ("", 123, []):
+            with self.subTest(malformed=malformed):
+                ledger = {"repository": "example/project", "objectives": [
+                    row("#506", pending_client_thread_id=malformed)]}
+                with self.assertRaises(mod.ReconcileError):
+                    mod.decide(ledger, {})
+
     def test_explicit_file_scope_holds_release_only_after_verified_closure(self):
         blocker = row("#542")
         held = [row("#465", dispatch_hold={"until": "#542", "reason": "session file overlap"}),

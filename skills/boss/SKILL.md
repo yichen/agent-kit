@@ -79,14 +79,24 @@ deduplicates by action ID, records the real task ID, and acknowledges it.
 ### Host runtime bridge
 
 `scripts/runtime_bridge.py` is the 15-minute host entry point for a legacy
-LearnRise ledger. It reads open GitHub PRs, attaches only unambiguous `Closes
-#N`/`Fixes #N`/`Resolves #N` links to the exact `#N` objective, refreshes the
-ledger with its repository audit, builds a task inventory from the local Codex
+LearnRise ledger. It reads open GitHub PRs, projects only unambiguous `Closes
+#N`/`Fixes #N`/`Resolves #N` links onto an isolated ledger snapshot, audits that
+snapshot, builds a task inventory from the local Codex
 catalog and rollout files, checks for live `codex exec resume --json <UUID>`
 writer processes, then invokes `reconcile_ledger.py scan`. A live writer wins
 over an earlier `task_complete`/`interrupted` record. Missing catalog entries,
 ambiguous PR links, malformed rollouts, audit failures, and stale observations
-fail closed. It never decides that a PR is safe to merge.
+fail closed. The canonical ownership ledger is never overwritten by this bridge;
+the audited `boss-observed-ledger.json` snapshot lives next to its task inventory.
+The snapshot carries discovered PR links across runs, including after merge.
+If the canonical ledger changes during an audit, the bridge stops before deciding
+actions and retries from fresh ownership on the next run. It checks the source
+again before writing the action outbox and before queuing a hub message. The hub
+must still recheck live ownership before executing an action. If an observed PR
+link was wrong, stop the bridge, correct or remove its observed snapshot, then
+restart; removing it only from the canonical ledger will not remove the carried
+link.
+It never decides that a PR is safe to merge.
 
 The bridge has no safe noninteractive API for creating desktop Codex tasks. Its
 `--hub-task` option queues structured action IDs to an existing monitoring hub
@@ -123,7 +133,7 @@ inspect the stdout/stderr logs and a live scan before declaring it deployed.
 The example must not be loaded before this code is merged and host skill
 installation is updated.
 Do not run a second bridge for the same outbox; the bridge uses a host lock,
-and ledger PR attachment uses compare-and-set. Use `--dry-run --skip-audit
+and PR links are projected onto its own snapshot. Use `--dry-run --skip-audit
 --prs-file <fixture> --processes-file <fixture>` for no-write local canaries.
 Verify a live run after installation: fresh GitHub audit, current task status,
 exact PR link, durable outbox, and monitoring-hub receipt. The local Codex

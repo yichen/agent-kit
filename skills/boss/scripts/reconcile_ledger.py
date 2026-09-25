@@ -154,6 +154,13 @@ def decide(ledger, tasks):
             actions.append(action(repo, row, "RECONCILE_ISSUE", task_id=task_id,
                                   pr=prs[-1], reason="all linked PRs merged but issue remains open; verify acceptance and closure gates"))
             continue
+        pending_client = row.get("pending_client_thread_id")
+        if not task_id and pending_client is not None:
+            if not isinstance(pending_client, str) or not pending_client.strip():
+                raise ReconcileError(f"{rid}: invalid pending client thread ID")
+            actions.append(action(repo, row, "RECOVER_OWNER",
+                                  reason="Codex task setup is pending; resolve the client thread ID before any launch"))
+            continue
         if task_id:
             task = tasks.get(task_id)
             if task is None:

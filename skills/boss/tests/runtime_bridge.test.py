@@ -69,6 +69,9 @@ class RuntimeBridgeTests(unittest.TestCase):
             ("Fixes #523", "work", "feature", [("#523", 603)], False),
             ("Implements the approved scope of #523", "Implement #523", "codex/523-feature", [("#523", 603)], False),
             ("Closes #523\nCloses #604", "work", "feature", [], True),
+            ("Closes #523", "Implement #604", "codex/604-feature", [], True),
+            ("Closes #523", "Implement #523", "codex/604-feature", [], True),
+            ("Closes #523", "Implement #604", "codex/523-feature", [], True),
             ("See #523", "work", "feature", [], True),
             ("", "Fix #523", "feature", [], True),
             ("", "Fix #523", "codex/604-feature", [], True),
@@ -85,6 +88,23 @@ class RuntimeBridgeTests(unittest.TestCase):
                         bridge.discover_open_prs(ledger, prs)
                 else:
                     self.assertEqual(bridge.discover_open_prs(ledger, prs), expected)
+
+    def test_existing_pr_link_conflicting_with_live_issue_fails_closed(self):
+        ledger = {"objectives": [objective(pull_requests=[603]), objective(604)]}
+        cases = [
+            ("Closes #604", "Implement #604", "codex/604-feature", True),
+            ("Closes #523", "Implement #604", "codex/604-feature", True),
+            ("Closes #523", "Implement #523", "codex/523-feature", False),
+        ]
+        for body, title, branch, raises in cases:
+            with self.subTest(body=body, title=title, branch=branch):
+                prs = [{"number": 603, "state": "OPEN", "body": body,
+                        "title": title, "headRefName": branch}]
+                if raises:
+                    with self.assertRaisesRegex(bridge.BridgeError, "conflict"):
+                        bridge.discover_open_prs(ledger, prs)
+                else:
+                    self.assertEqual(bridge.discover_open_prs(ledger, prs), [])
 
     def test_malformed_linked_pr_numbers_fail_before_attachment(self):
         cases = [
@@ -103,6 +123,42 @@ class RuntimeBridgeTests(unittest.TestCase):
                     bridge.discover_open_prs(ledger, prs)
                 self.assertEqual(ledger["objectives"][0]["pull_requests"], linked)
 
+    def test_malformed_objective_shape_fails_closed(self):
+        for ledger in (None, [], {}, {"objectives": None}, {"objectives": [None]},
+                       {"objectives": [{"issue_number": 523}]},
+                       {"objectives": [objective(523), objective(523)]}):
+            with self.subTest(ledger=ledger):
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.discover_open_prs(ledger, [])
+
+    def test_pr_projection_does_not_change_source_ledger(self):
+        ledger = {"objectives": [objective(523), objective(604, pull_requests=[615])]}
+        before = json.dumps(ledger, sort_keys=True)
+        projected = bridge.project_prs(ledger, [("#523", 603)])
+        self.assertEqual(json.dumps(ledger, sort_keys=True), before)
+        self.assertEqual(projected["objectives"][0]["pull_requests"], [603])
+        self.assertEqual(projected["objectives"][1]["pull_requests"], [615])
+
+    def test_discovered_pr_survives_next_scan_after_merge(self):
+        source = {"repository": "example/project", "objectives": [objective(523)]}
+        first = bridge.project_prs(source, [("#523", 603)])
+        second = bridge.carry_observed_prs(source, first)
+        self.assertEqual(second["objectives"][0]["pull_requests"], [603])
+        second["objectives"][0]["pull_request_states"] = {"603": "MERGED"}
+        actions, _ = bridge.reconcile.decide(second, {})
+        self.assertEqual([a["verb"] for a in actions], ["RECONCILE_ISSUE"])
+        self.assertEqual(source["objectives"][0]["pull_requests"], [])
+
+    def test_canonical_change_during_audit_stops_action_decision(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "ownership.json"
+            path.write_text('{"owner":"before"}')
+            original = path.read_bytes()
+            bridge.require_unchanged(path, original)
+            path.write_text('{"owner":"new coding task"}')
+            with self.assertRaisesRegex(bridge.BridgeError, "changed during audit"):
+                bridge.require_unchanged(path, original)
+
     def test_missing_catalog_and_partial_rollout_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -114,10 +170,25 @@ class RuntimeBridgeTests(unittest.TestCase):
             ledger = {"objectives": [objective(coding_task_id=TASK)]}
             with self.assertRaises(bridge.BridgeError):
                 bridge.inventory(ledger, db, "", datetime.now(timezone.utc))
+            connection = sqlite3.connect(db)
+            connection.execute("INSERT INTO threads VALUES(?, ?)", (TASK, None))
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(bridge.BridgeError, "invalid rollout path"):
+                bridge.inventory(ledger, db, "", datetime.now(timezone.utc))
+            connection = sqlite3.connect(db)
+            connection.execute("UPDATE threads SET rollout_path='' WHERE id=?", (TASK,))
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(bridge.BridgeError, "invalid rollout path"):
+                bridge.inventory(ledger, db, "", datetime.now(timezone.utc))
             rollout = root / "rollout.jsonl"
-            rollout.write_text("{incomplete\n")
-            with self.assertRaises(bridge.BridgeError):
-                bridge.rollout_status(rollout)
+            for malformed in ("{incomplete", "null", "[]", '{"type":"event_msg","payload":null}',
+                              '{"type":"event_msg","payload":[]}'):
+                with self.subTest(malformed=malformed):
+                    rollout.write_text(malformed + "\n")
+                    with self.assertRaises(bridge.BridgeError):
+                        bridge.rollout_status(rollout)
 
     def test_dry_run_does_not_create_lock_inventory_or_outbox(self):
         with tempfile.TemporaryDirectory() as root:
