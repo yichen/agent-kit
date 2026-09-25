@@ -39,6 +39,14 @@ def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=180)
 
 
+def open_pr_inventory_command(repo: str) -> list[str]:
+    if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+            or any(part in {".", ".."} for part in repo.split("/"))):
+        raise BridgeError("invalid ledger repository")
+    return ["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
+            "--json", "number,state,title,body,headRefName,headRefOid,baseRefName,mergeable"]
+
+
 def writer_ids(processes: str) -> set[str]:
     result = set()
     for line in processes.splitlines():
@@ -457,8 +465,7 @@ def main(argv=None) -> int:
         if args.prs_file:
             prs = json.loads(args.prs_file.read_text())
         else:
-            result = run(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
-                          "--json", "number,state,title,body,headRefName,headRefOid,mergeable"])
+            result = run(open_pr_inventory_command(repo))
             if result.returncode:
                 raise BridgeError(f"GitHub open PR inventory failed: {result.stderr.strip()}")
             prs = json.loads(result.stdout)
