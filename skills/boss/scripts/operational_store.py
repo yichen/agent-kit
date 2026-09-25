@@ -417,7 +417,11 @@ def dispatch(con, db_path, repo, issue, phase, owner, generation, verb, adapter,
             finish_action(con, repo, issue, phase, owner, generation, row["action_id"], token, "Adapter call returned without a valid task ID; reconcile the live inventory")
             raise ValueError(f"adapter returned no valid task_id; reservation {row['action_id']} remains for reconciliation")
         acknowledge(con, repo, issue, phase, owner, generation, row["action_id"], task_id)
-        return {"action_id": row["action_id"], "task_id": task_id, "status": "acknowledged"}
+        response = {"action_id": row["action_id"], "task_id": task_id, "status": "acknowledged"}
+        task_url = answer.get("url")
+        if isinstance(task_url, str) and task_url == f"codex://threads/{task_id}":
+            response["url"] = task_url
+        return response
 
 
 def main():
@@ -444,6 +448,7 @@ def main():
     sub.choices["dispatch"].add_argument("--generation", type=int, required=True)
     sub.choices["dispatch"].add_argument("--verb", required=True)
     sub.choices["dispatch"].add_argument("--adapter", required=True)
+    sub.choices["dispatch"].add_argument("--repo-path", type=Path)
     sub.choices["dispatch"].add_argument("--kind", choices=("feature", "testability"))
     sub.choices["dispatch"].add_argument("--master")
     sub.choices["ack"].add_argument("--generation", type=int, required=True)
@@ -496,6 +501,12 @@ def main():
                 raise ValueError("generation must be positive")
             valid_id(args.verb, "verb")
             context = {key: value for key, value in (("kind", args.kind), ("master", args.master)) if value is not None}
+            if args.repo_path is not None:
+                if not args.repo_path.is_absolute() or not args.repo_path.is_dir():
+                    raise ValueError("repo path must be an existing absolute directory")
+                if canonical_repo(args.repo_path) != repo:
+                    raise ValueError("repo path origin does not match the canonical repository")
+                context["repo_path"] = str(args.repo_path.resolve())
             if args.master:
                 valid_id(args.master, "master")
             result = dispatch(con, args.db, repo, args.issue, args.phase, args.owner, args.generation, args.verb, args.adapter, context)
