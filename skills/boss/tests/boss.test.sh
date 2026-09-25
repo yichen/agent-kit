@@ -78,6 +78,9 @@ export BOSS_TEST_REQUEST="$ROOT/adapter-request"
 run ticket pr --repo "$REPO" --issue 1 --pr 12 > /dev/null
 expect_fail 'linked merged PR' ticket resolve --repo "$REPO" --issue 1 --pr 11 --note done
 run ticket resolve --repo "$REPO" --issue 1 --pr 12 --note done > /dev/null
+OPS="$SKILL_ROOT/scripts/operational_store.py"
+ops() { python3 "$OPS" --db "$AGENTS_ARTIFACTS_ROOT/boss/operations.sqlite3" "$@" --repo "$REPO"; }
+GEN2="$(ops claim --issue 2 --phase implement --owner boss-A | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
 state_before="$(shasum -a 256 "$STATE")"
 run ticket launch --repo "$REPO" --issue 2 --adapter "$ADAPTER" > "$ROOT/preview"
 test ! -e "$BOSS_TEST_REQUEST"
@@ -97,31 +100,36 @@ assert data['created_5h']==[11,12]
 assert data['merged_features_5h']==[{'issue':1,'pr':12,'summary':'Reading practice','availability':'testable','test_environment':'staging iPad','human_gate':'Parent acceptance required'}]
 PY
 
-expect_fail 'absolute executable' ticket launch --repo "$REPO" --issue 2 --adapter 'sh;touch-owned' --apply
+expect_fail 'absolute executable' ticket launch --repo "$REPO" --issue 2 --adapter 'sh;touch-owned' --apply --phase implement --owner boss-A --generation "$GEN2"
 test ! -e "$ROOT/touch-owned"
-run ticket launch --repo "$REPO" --issue 2 --adapter "$ADAPTER" --apply > /dev/null
+run ticket launch --repo "$REPO" --issue 2 --adapter "$ADAPTER" --apply --phase implement --owner boss-A --generation "$GEN2" > /dev/null
 python3 - "$BOSS_TEST_REQUEST" <<'PY'
 import json,sys
 assert json.load(open(sys.argv[1]))['issue']==2
 PY
-expect_fail 'already launched' ticket launch --repo "$REPO" --issue 2 --adapter "$ADAPTER" --apply
+expect_fail 'already launched' ticket launch --repo "$REPO" --issue 2 --adapter "$ADAPTER" --apply --phase implement --owner boss-A --generation "$GEN2"
 run ticket add --repo "$REPO" --issue 3 --kind feature > /dev/null
+GEN3="$(ops claim --issue 3 --phase implement --owner boss-A | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
 FAIL_ADAPTER="$ROOT/fail-adapter"
 cat > "$FAIL_ADAPTER" <<'SH'
 #!/bin/sh
 exit 1
 SH
 chmod +x "$FAIL_ADAPTER"
-expect_fail 'launch reservation remains' ticket launch --repo "$REPO" --issue 3 --adapter "$FAIL_ADAPTER" --apply
-expect_fail 'already launched' ticket launch --repo "$REPO" --issue 3 --adapter "$ADAPTER" --apply
+expect_fail 'launch reservation remains' ticket launch --repo "$REPO" --issue 3 --adapter "$FAIL_ADAPTER" --apply --phase implement --owner boss-A --generation "$GEN3"
+expect_fail 'launch reservation' ticket launch --repo "$REPO" --issue 3 --adapter "$ADAPTER" --apply --phase implement --owner boss-A --generation "$GEN3"
 ACTION_ID="$(python3 - "$STATE" <<'PY'
 import json,sys
 print(json.load(open(sys.argv[1]))['tickets']['3']['action_id'])
 PY
 )"
 expect_fail 'precondition failed' ticket confirm --repo "$REPO" --issue 3 --action-id wrong --task-id task-3
-run ticket abandon --repo "$REPO" --issue 3 --action-id "$ACTION_ID" --evidence 'Checked the task list and found no task' > /dev/null
-run ticket launch --repo "$REPO" --issue 3 --adapter "$ADAPTER" > /dev/null
+python3 - "$ROOT/no-tasks.json" <<'PY'
+import datetime,json,sys
+json.dump({'as_of':datetime.datetime.now(datetime.timezone.utc).isoformat(),'tasks':[]},open(sys.argv[1],'w'))
+PY
+run ticket abandon --repo "$REPO" --issue 3 --action-id "$ACTION_ID" --phase implement --owner boss-A --generation "$GEN3" --inventory "$ROOT/no-tasks.json" --evidence 'Checked the task list and found no task' > /dev/null
+run ticket launch --repo "$REPO" --issue 3 --adapter "$ADAPTER" --apply --phase implement --owner boss-A --generation "$GEN3" > /dev/null
 run ticket pr --repo "$REPO" --issue 2 --pr 11 > /dev/null
 expect_fail 'already linked' ticket pr --repo "$REPO" --issue 1 --pr 11
 expect_fail 'already linked' ticket pr --repo "$REPO" --issue 2 --pr 12

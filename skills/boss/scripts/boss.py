@@ -284,10 +284,17 @@ def main():
     tsub.choices["pr"].add_argument("--pr", type=int, required=True)
     tsub.choices["launch"].add_argument("--adapter", required=True)
     tsub.choices["launch"].add_argument("--apply", action="store_true")
+    tsub.choices["launch"].add_argument("--phase")
+    tsub.choices["launch"].add_argument("--owner")
+    tsub.choices["launch"].add_argument("--generation", type=int)
     tsub.choices["confirm"].add_argument("--action-id", required=True)
     tsub.choices["confirm"].add_argument("--task-id", required=True)
     tsub.choices["abandon"].add_argument("--action-id", required=True)
     tsub.choices["abandon"].add_argument("--evidence", required=True)
+    tsub.choices["abandon"].add_argument("--phase", required=True)
+    tsub.choices["abandon"].add_argument("--owner", required=True)
+    tsub.choices["abandon"].add_argument("--generation", type=int, required=True)
+    tsub.choices["abandon"].add_argument("--inventory", required=True)
     monitor = sub.add_parser("monitor")
     msub = monitor.add_subparsers(dest="action", required=True)
     msub.add_parser("set").add_argument("--repo", required=True)
@@ -386,6 +393,7 @@ def main():
                 evidence = args.evidence.strip()
                 if len(evidence) < 10 or len(evidence) > 500:
                     fail("abandonment evidence must be 10-500 characters")
+                operational_store(repo, "abandon", "--issue", str(number), "--phase", args.phase, "--owner", args.owner, "--generation", str(args.generation), "--action-id", args.action_id, "--inventory", args.inventory, "--evidence", evidence)
                 tickets[key].update(status="ready", launch_abandoned_at=iso(now()), launch_abandonment=evidence)
                 save(path, state)
             else:
@@ -393,10 +401,15 @@ def main():
                 adapter = Path(args.adapter)
                 if not adapter.is_absolute() or not adapter.is_file() or not os.access(adapter, os.X_OK):
                     fail("adapter must be an absolute executable file")
-                action_id = hashlib.sha256(f"{state['repo']}:{number}:launch".encode()).hexdigest()
+                if not args.phase or not args.owner or not args.generation or args.generation <= 0:
+                    fail("ticket launch --apply requires --phase, --owner, and the active claim --generation")
+                reservation = operational_store(repo, "reserve", "--issue", str(number), "--phase", args.phase, "--owner", args.owner, "--generation", str(args.generation), "--verb", "launch")
+                if not reservation.get("created"):
+                    fail(f"action already reserved ({reservation['action']['status']}); reconcile by action ID before any retry")
+                action_id = reservation["action"]["action_id"]
                 tickets[key].update(status="launching", action_id=action_id, launch_started_at=iso(now()))
                 save(path, state)
-                request = {"repo": repo, "issue": number, "kind": tickets[key]["kind"], "master": state["master"], "action_id": action_id}
+                request = {"repo": repo, "issue": number, "phase": args.phase, "generation": args.generation, "owner": args.owner, "kind": tickets[key]["kind"], "master": state["master"], "action_id": action_id}
                 result = subprocess.run([str(adapter)], input=json.dumps(request), capture_output=True, text=True, timeout=120)
                 if result.returncode:
                     fail(f"adapter failed; launch reservation remains for reconciliation: {result.stderr.strip()[:300]}")
@@ -405,6 +418,7 @@ def main():
                     task_id = identifier(answer["task_id"], "task ID")
                 except (ValueError, KeyError, TypeError, json.JSONDecodeError):
                     fail("adapter returned no valid task_id; launch reservation remains for reconciliation")
+                operational_store(repo, "ack", "--issue", str(number), "--phase", args.phase, "--generation", str(args.generation), "--action-id", action_id, "--task-id", task_id)
                 tickets[key].update(status="launched", task_id=task_id, launched_at=iso(now()))
                 save(path, state)
         print(json.dumps({"issue": number, "status": tickets[key]["status"]}))
@@ -448,12 +462,25 @@ def launch_eligibility(state, number):
     ticket = state["tickets"].get(str(number))
     if not ticket:
         fail("unknown ticket")
+    if ticket["status"] == "launching":
+        fail("ticket already has a launch reservation; reconcile by action ID before any retry")
     if ticket["status"] != "ready":
         fail("ticket is already launched or resolved")
     blocked = [dep for dep in ticket["depends"] if state["tickets"][str(dep)]["status"] != "resolved"]
     if blocked:
         fail(f"unresolved dependencies: {blocked}")
     return {"issue": number, "eligible": True, "will_launch": False}
+
+
+def operational_store(repo, *arguments):
+    script = Path(__file__).with_name("operational_store.py")
+    result = subprocess.run([sys.executable, str(script), *arguments, "--repo", repo], capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        fail(result.stderr.strip()[:500] or "operational store command failed")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        fail("operational store returned invalid output")
 
 
 if __name__ == "__main__":
