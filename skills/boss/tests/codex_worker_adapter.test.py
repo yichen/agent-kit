@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
@@ -144,6 +145,27 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         self.assertEqual(resume_call["threadId"], TASK)
         self.assertEqual(json.loads(out.getvalue())["task_id"], TASK)
         self.assertEqual(json.loads(out.getvalue())["url"], f"codex://threads/{TASK}")
+
+    def test_concurrent_resume_is_serialized_to_one_writer(self):
+        resume_root = self.root / "concurrent-resume-repo"
+        resume_root.mkdir()
+        adapter.run(["git", "init", "--initial-branch=main", str(resume_root)])
+        server = FakeServer([row(turn_status="interrupted", cwd=str(resume_root))])
+        request_data = {"action_id": ACTION, "task_id": TASK, "prompt": "continue"}
+        with mock.patch.object(adapter, "check_live_writer", return_value=None), \
+             mock.patch.object(adapter, "output_task"):
+            def attempt():
+                try:
+                    adapter.resume(server, request_data)
+                    return "resumed"
+                except adapter.AdapterError as exc:
+                    return str(exc)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(lambda _: attempt(), range(2)))
+        self.assertEqual(outcomes.count("resumed"), 1)
+        self.assertEqual(sum("task is running" in item for item in outcomes), 1)
+        self.assertEqual(sum(method == "thread/resume" for method, _ in server.calls), 1)
+        self.assertEqual(sum(method == "turn/start" for method, _ in server.calls), 1)
 
     def test_mismatched_task_id_fails_before_resume(self):
         server = FakeServer([row(), row(TASK2, "b" * 64)])

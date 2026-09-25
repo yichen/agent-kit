@@ -100,7 +100,8 @@ and pilot pass.
 app-server through `codex app-server proxy`; it never starts or restarts a
 daemon. Launch checks that the issue is open, no open PR already references
 it, the source checkout is clean, and its GitHub default branch can be freshly
-fetched. It creates and verifies a sibling worktree and a stable action branch,
+fetched, and that the GitHub account has write access. It creates and verifies
+a sibling worktree and a stable action branch,
 then starts one visible Codex thread with `on-request` approvals and
 `workspace-write` sandboxing. Its `threadSource` records the SQLite action ID,
 so a retry or a caller crash can recover the same real task UUID and
@@ -116,6 +117,8 @@ checks current app-server status and local writer processes, refuses an
 active task or any live writer, and resumes only its verified worktree. If the
 app-server socket is unavailable, launch, inventory, and resume fail closed.
 Do not report task setup complete while only a pending client ID is known.
+Per-action locks serialize retries and resumes; a per-issue lock prevents
+different action IDs from racing to launch duplicate workers.
 
 ### Host runtime bridge
 

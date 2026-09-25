@@ -302,17 +302,26 @@ def find_action(server, action_id):
 
 
 @contextlib.contextmanager
-def action_lock(action_id):
+def keyed_lock(key):
     root = Path(os.environ.get("AGENTS_ARTIFACTS_ROOT", str(Path.home() / "agents-artifacts")))
     directory = root / "boss" / "codex-action-locks"
     directory.mkdir(parents=True, exist_ok=True)
-    lock_path = directory / f"{action_id}.lock"
+    lock_name = hashlib.sha256(key.encode()).hexdigest()
+    lock_path = directory / f"{lock_name}.lock"
     with lock_path.open("a+") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def action_lock(action_id):
+    return keyed_lock(f"action:{action_id}")
+
+
+def issue_lock(repo, issue):
+    return keyed_lock(f"issue:{repo}:{issue}")
 
 
 def output_task(task_id):
@@ -382,7 +391,10 @@ def launch(server, request):
     issue = request.get("issue")
     if type(issue) is not int or issue <= 0:
         raise AdapterError("a positive issue number is required")
-    with action_lock(action_id):
+    repo = request.get("repo")
+    if not isinstance(repo, str) or not repo:
+        raise AdapterError("canonical GitHub repo is required")
+    with action_lock(action_id), issue_lock(repo, issue):
         _launch_locked(server, request)
 
 
@@ -391,7 +403,7 @@ def inspect(server):
     print(json.dumps({"as_of": now, "tasks": inventory(server)}, separators=(",", ":")))
 
 
-def resume(server, request):
+def _resume_locked(server, request):
     action_id, task_id = request.get("action_id"), request.get("task_id")
     if not isinstance(action_id, str) or not ACTION_RE.fullmatch(action_id):
         raise AdapterError("a 64-character stable action_id is required")
@@ -422,6 +434,14 @@ def resume(server, request):
     server.call("turn/start", {"threadId": task_id, "clientUserMessageId": message_id,
                                 "input": [{"type": "text", "text": prompt}]})
     output_task(task_id)
+
+
+def resume(server, request):
+    action_id = request.get("action_id") if isinstance(request, dict) else None
+    if not isinstance(action_id, str) or not ACTION_RE.fullmatch(action_id):
+        raise AdapterError("a 64-character stable action_id is required")
+    with action_lock(action_id):
+        _resume_locked(server, request)
 
 
 def main():
