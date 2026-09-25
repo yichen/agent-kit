@@ -274,6 +274,7 @@ SH
   chmod +x "$MOCK_BIN/$forbidden"
 done
 export BOSS_FORBIDDEN_CALLS="$ROOT/forbidden-calls"
+ops claim --issue 55 --phase investigate --owner history-worker > /dev/null
 state_before="$(shasum -a 256 "$STATE")"
 db_before="$(shasum -a 256 "$DB")"
 before_artifacts="$(find "$AGENTS_ARTIFACTS_ROOT" -print | sort; find "$AGENTS_ARTIFACTS_ROOT" -type f -exec shasum -a 256 {} \; | sort)"
@@ -282,6 +283,7 @@ PATH="$MOCK_BIN:$PATH" python3 "$BOSS" metrics --repo "$REPO" --json > "$ROOT/me
 PATH="$MOCK_BIN:$PATH" python3 "$BOSS" history 2 --repo "$REPO" --json > "$ROOT/history"
 PATH="$MOCK_BIN:$PATH" python3 "$BOSS" history task-2 --repo "$REPO" --json > "$ROOT/task-history"
 PATH="$MOCK_BIN:$PATH" python3 "$BOSS" history missing-task-xyz --repo "$REPO" --json > "$ROOT/empty-history"
+PATH="$MOCK_BIN:$PATH" python3 "$BOSS" history 55 --repo "$REPO" --json > "$ROOT/untracked-issue-history"
 after_artifacts="$(find "$AGENTS_ARTIFACTS_ROOT" -print | sort; find "$AGENTS_ARTIFACTS_ROOT" -type f -exec shasum -a 256 {} \; | sort)"
 test "$before_artifacts" = "$after_artifacts"
 test ! -e "$BOSS_FORBIDDEN_CALLS"
@@ -297,11 +299,12 @@ import json,sys
 data=json.load(open(sys.argv[1]))
 assert data['merged_5h']=='unknown' and data['freshness']['github']['status']=='unknown'
 PY
-python3 - "$ROOT/task-history" "$ROOT/empty-history" <<'PY'
+python3 - "$ROOT/task-history" "$ROOT/empty-history" "$ROOT/untracked-issue-history" <<'PY'
 import json,sys
-task,missing=[json.load(open(path)) for path in sys.argv[1:]]
+task,missing,untracked=[json.load(open(path)) for path in sys.argv[1:]]
 assert any(event['kind']=='action_acknowledged' for event in task['events'])
 assert missing['events']==[] and missing['pr_actions']==[]
+assert any(event['issue']==55 and event['kind']=='claim_acquired' for event in untracked['events'])
 PY
 
 # Table-driven PR classification: head, CI, conflict, review, and malformed input.
@@ -334,5 +337,9 @@ for invalid in ([{'status':'evil;touch-owned'}],{'bad':True}):
         raise AssertionError('malformed check accepted')
 assert boss.pr_actions('example/project',base,True,instant)==boss.pr_actions('example/project',base,True,instant)
 assert boss.pr_actions('example/project',base,False,instant)[0]['kind']=='unlinked'
+state={'repo':'example/project','master':'boss-A','tickets':{'7':{'issue':7,'kind':'feature','depends':[],'summary':'item','availability':'unknown','test_environment':'unknown','human_gate':'unknown','status':'ready','prs':[31]}},'monitor':{'name':None,'last_scan_at':None},'action_history':{}}
+event={'issue':7,'phase':'implement','action_id':None,'kind':'claim_acquired','at':boss.iso(instant),'details':'{"owner":"worker-A"}'}
+report=boss.report(state,[base],instant,{'active_claims':[],'actions':[],'latest_events':[event]})
+assert report['open_prs'][0]['last_meaningful_action']['kind']=='claim_acquired'
 PY
 printf '%s\n' 'boss tests passed'

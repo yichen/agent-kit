@@ -267,6 +267,7 @@ def report(state, inventory, instant, operational=None, source_errors=None):
         action = latest_action.get(issue) if issue is not None else None
         blocker = next((item["blocker"] for item in actions if item["pr"] == pr["number"]), None)
         task_id = action.get("task_id") if action else None
+        last_action = ({"kind": action["status"], "verb": action["verb"], "at": action.get("verified_at") or action.get("acknowledged_at") or action.get("reserved_at"), "action_id": action["action_id"]} if action else ({key: event.get(key) for key in ("kind", "at", "phase", "action_id")} if issue is not None and (event := latest_events.get(issue)) else "unknown"))
         pr_report.append({
             **pr,
             "issue": issue or "unknown",
@@ -277,7 +278,7 @@ def report(state, inventory, instant, operational=None, source_errors=None):
             "blocker": blocker or "unknown",
             "dependency": ticket["depends"] if ticket else "unknown",
             "human_gate": ticket.get("human_gate", "unknown") if ticket else "unknown",
-            "last_meaningful_action": ({"kind": action["status"], "at": action.get("verified_at") or action.get("acknowledged_at") or action.get("reserved_at"), "action_id": action["action_id"]} if action else "unknown"),
+            "last_meaningful_action": last_action,
         })
     tickets_report = []
     for ticket in tickets.values():
@@ -394,8 +395,9 @@ def main():
             matching_tickets = [ticket for ticket in state["tickets"].values() if ticket["issue"] == issue] if issue is not None else [ticket for ticket in state["tickets"].values() if numeric is not None and numeric in ticket["prs"]]
             if issue is None and matching_tickets:
                 issue = matching_tickets[0]["issue"]
+            history_issue = issue if issue is not None else numeric
             try:
-                events = operational_store(repo, "history", "--issue", str(issue)) if issue is not None else operational_store(repo, "history")
+                events = operational_store(repo, "history", "--issue", str(history_issue)) if history_issue is not None else operational_store(repo, "history")
             except (ValueError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
                 result = {"item": args.item, "events": "unknown", "pr_actions": "unknown", "as_of": iso(now()), "source": {"status": "unknown", "error": str(exc), "checked_at": iso(now())}}
             else:
@@ -414,7 +416,7 @@ def main():
                         return False
                     return contains_exact(details)
 
-                matches = [event for event in events if issue is not None or exact_event_match(event, item)]
+                matches = [event for event in events if issue is not None or (numeric is not None and event.get("issue") == numeric) or exact_event_match(event, item)]
                 ticket_prs = {pr for ticket in matching_tickets for pr in ticket["prs"]}
                 if numeric is not None and not matching_tickets:
                     ticket_prs.add(numeric)
