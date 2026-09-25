@@ -93,8 +93,17 @@ class SchedulerTests(unittest.TestCase):
             "20": {"issue": 20, "status": "ready", "depends": [18], "prs": []},
         }
         report = check_report(sample_state(tickets=tickets), issue_rows((18, "OPEN"), (19, "OPEN"), (20, "OPEN")))
-        self.assertEqual(report["pilot_candidates"], [])
+        self.assertEqual(report["dependency_ready_issues"], [])
+        self.assertIsNone(report["low_risk_pilot_issue"])
         self.assertIn("no dependency-ready", report["pilot_blocker"])
+        self.assertFalse(report["eligible_for_cutover"])
+
+    def test_dependency_readiness_alone_never_approves_a_low_risk_pilot(self):
+        tickets = {"21": {"issue": 21, "status": "ready", "depends": [], "prs": []}}
+        report = check_report(sample_state(tickets=tickets), issue_rows((21, "OPEN")), claims=[])
+        self.assertEqual(report["dependency_ready_issues"], [21])
+        self.assertIsNone(report["low_risk_pilot_issue"])
+        self.assertIn("explicit human pilot selection is missing", report["pilot_blocker"])
         self.assertFalse(report["eligible_for_cutover"])
 
     def test_stale_manual_scan_does_not_break_recurring_shadow_scheduler(self):

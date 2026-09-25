@@ -222,5 +222,7 @@ Assignment remains disabled in this release. Cutover requires resolved
 ownership discrepancies, passing canaries, a safe existing `agent-kit` pilot
 through verified completion, and recorded human/product acceptance. If no
 eligible pilot issue exists, leave assignment disabled and report the blocker.
+Dependency readiness is reported separately from low-risk suitability; it
+never approves a pilot. A human must explicitly select and accept the pilot.
 Issue #20 stays unlaunched; this scheduler neither implements nor claims a
 global Pi slot across hosts.

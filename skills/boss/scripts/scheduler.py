@@ -267,13 +267,14 @@ def compare(state: dict, issues: list[dict], prs: list[dict], tasks: dict, claim
     for pr in all_prs:
         if pr.get("number") not in tracked_prs:
             disputes.append({"kind": "untracked_open_pr", "pr": pr.get("number"), "head": pr.get("headRefOid")})
-    pilot_candidates = []
+    dependency_ready_issues = []
     for issue, ticket in state["tickets"].items():
         if ticket.get("status") != "ready":
             continue
         if all(state["tickets"].get(str(dep), {}).get("status") == "resolved" for dep in ticket.get("depends", [])):
             if issue_map.get(ticket.get("issue"), {}).get("state") == "OPEN":
-                pilot_candidates.append(ticket.get("issue"))
+                dependency_ready_issues.append(ticket.get("issue"))
+    dependency_ready_issues.sort()
     return {"as_of": now.isoformat().replace("+00:00", "Z"), "repository": "yichen/agent-kit",
             "mode": "shadow", "assignment_enabled": False, "pi_dispatch_enabled": False,
             "pi_dispatch": "disabled; issue #20 remains gated and unlaunched",
@@ -286,8 +287,10 @@ def compare(state: dict, issues: list[dict], prs: list[dict], tasks: dict, claim
                           "live_task_observations": len(task_map), "agent_kit_live_tasks": len(tasks.get("relevant", [])),
                           "all_live_threads": tasks.get("all_live_threads", len(task_map)), "active_claims": len(claims),
                           "remaining_claim_capacity": max(0, 1 - len(claims))},
-            "pilot_candidates": pilot_candidates,
-            "pilot_blocker": None if pilot_candidates else "no dependency-ready tracked issue is available for low-risk pilot selection",
+            "dependency_ready_issues": dependency_ready_issues,
+            "low_risk_pilot_issue": None,
+            "pilot_blocker": ("no dependency-ready tracked issue is available" if not dependency_ready_issues else
+                              "dependency readiness does not establish low-risk suitability; explicit human pilot selection is missing"),
             "cutover_requirements": ["resolved ownership disputes", "all canaries pass", "one safe pilot completes", "human/product acceptance recorded"],
             "disputes": disputes, "disputed": bool(disputes), "eligible_for_cutover": False}
 
