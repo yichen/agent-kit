@@ -41,6 +41,29 @@ if [ "$MODE" != "stop" ] && { [ ! -x "$SKILL_PATH/scripts/scheduler.py" ] || [ !
   exit 2
 fi
 
+resolve_gh() {
+  local candidate
+  candidate="$(type -P gh 2>/dev/null || true)"
+  if [ -z "$candidate" ]; then
+    echo "boss scheduler: cannot find the gh executable on the installer PATH" >&2
+    return 1
+  fi
+  if [[ "$candidate" != /* || "$candidate" == *$'\n'* || "$candidate" == *$'\r'* || "$candidate" == *:* ]] || [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; then
+    echo "boss scheduler: gh resolved to an invalid or non-executable path: $candidate" >&2
+    return 1
+  fi
+  GH_BIN="$candidate"
+  GH_DIR="${candidate%/*}"
+}
+
+xml_escape() {
+  local value="$1"
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  printf '%s' "$value"
+}
+
 loaded() {
   launchctl print "gui/$UID_NUM/$1" >/dev/null 2>&1
 }
@@ -76,6 +99,13 @@ if [ "$MODE" = "stop" ]; then
   exit 0
 fi
 
+if ! resolve_gh; then
+  exit 2
+fi
+# launchd does not inherit the user's interactive PATH. Keep the system tool
+# directories and only the directory containing the validated gh executable.
+LAUNCH_PATH_XML="$(xml_escape "/usr/bin:/bin:/usr/sbin:/sbin:$GH_DIR")"
+
 mkdir -p "$AGENTS_DIR" "$STATE_DIR"
 bootout_if_loaded "$LABEL"
 bootout_if_loaded "$WATCHDOG_LABEL"
@@ -93,6 +123,9 @@ cat >"$SCHEDULER_PLIST" <<EOF
     <string>--last-success</string><string>$LAST_SUCCESS</string>
     <string>--write-last-success</string>
   </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>$LAUNCH_PATH_XML</string>
+  </dict>
   <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$STDOUT</string>
