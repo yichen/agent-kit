@@ -388,7 +388,7 @@ def main():
                 tickets[key].update(status="launched", task_id=identifier(args.task_id, "task ID"), launched_at=iso(now()))
                 save(path, state)
             elif args.action == "abandon":
-                if key not in tickets or tickets[key]["status"] != "launching" or tickets[key].get("action_id") != args.action_id:
+                if key not in tickets or (tickets[key]["status"] == "launching" and tickets[key].get("action_id") != args.action_id) or tickets[key]["status"] not in ("ready", "launching"):
                     fail("launch abandonment precondition failed")
                 evidence = args.evidence.strip()
                 if len(evidence) < 10 or len(evidence) > 500:

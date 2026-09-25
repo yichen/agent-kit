@@ -130,6 +130,11 @@ json.dump({'as_of':datetime.datetime.now(datetime.timezone.utc).isoformat(),'tas
 PY
 run ticket abandon --repo "$REPO" --issue 3 --action-id "$ACTION_ID" --phase implement --owner boss-A --generation "$GEN3" --inventory "$ROOT/no-tasks.json" --evidence 'Checked the task list and found no task' > /dev/null
 run ticket launch --repo "$REPO" --issue 3 --adapter "$ADAPTER" --apply --phase implement --owner boss-A --generation "$GEN3" > /dev/null
+run ticket add --repo "$REPO" --issue 4 --kind feature > /dev/null
+GEN4="$(ops claim --issue 4 --phase implement --owner boss-A | python3 -c 'import json,sys;print(json.load(sys.stdin)["generation"])')"
+ACTION4="$(ops reserve --issue 4 --phase implement --owner boss-A --generation "$GEN4" --verb launch | python3 -c 'import json,sys;print(json.load(sys.stdin)["action"]["action_id"])')"
+run ticket abandon --repo "$REPO" --issue 4 --action-id "$ACTION4" --phase implement --owner boss-A --generation "$GEN4" --inventory "$ROOT/no-tasks.json" --evidence 'Fresh inventory confirms no task was created' > /dev/null
+run ticket launch --repo "$REPO" --issue 4 --adapter "$ADAPTER" --apply --phase implement --owner boss-A --generation "$GEN4" > /dev/null
 run ticket pr --repo "$REPO" --issue 2 --pr 11 > /dev/null
 expect_fail 'already linked' ticket pr --repo "$REPO" --issue 1 --pr 11
 expect_fail 'already linked' ticket pr --repo "$REPO" --issue 2 --pr 12
