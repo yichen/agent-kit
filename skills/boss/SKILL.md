@@ -30,3 +30,41 @@ Run `status --repo ...` for open PRs, PR IDs created and merged by hour in the l
 `handoff --repo ...` prints a short report for the configured monitoring hub, including the exact repo, master, active tickets, open PRs, monitor state, and unresolved gaps. Send that report to the hub task only when the user authorized the communication or the monitoring workflow itself calls for it. Request an acknowledgment from the hub; retain the master task's ownership until the hub has accepted monitoring. `status`, `doctor`, `reconcile`, and `handoff` are read-only; they never start background jobs or make GitHub writes.
 
 The helper's `--prs-file` fixture option is for local canary tests only. Do not pass it when reporting live GitHub status.
+
+## Deterministic legacy-ledger transition
+
+For a repository still using a separate ownership ledger, run the repository's
+GitHub audit first, then supply a **fresh** Codex task inventory to
+`scripts/reconcile_ledger.py`. Its `plan` command is read-only. `scan` writes a
+durable outbox of action contracts and exits 3 when an action remains
+unacknowledged after one 15-minute cycle, or when an acknowledged action has
+not changed live state by the next cycle. The next monitor run must treat exit
+3 as a failure, not a quiet status. Stale observations and unknown task states
+exit 2 and block dispatch. The script does not trust `owner_active`, free-form
+`next_gate`, or a parent epic's OPEN status for a PR-completed phase.
+
+The task inventory format is `{"as_of":"2026-09-25T14:00:00Z","tasks":[{"id":"<Codex UUID>","status":"queued|running|completed|interrupted|blocked"}]}`.
+Create it from the host's actual task API immediately before each scan; never
+invent a status. A scope collision is a structured ledger field
+`"dispatch_hold":{"until":"#542","reason":"overlapping session files"}`.
+The `until` objective must be verified complete before dispatch. Keep human
+acceptance in `human_gate`; the script never converts a human gate to code
+completion.
+
+Each action has a stable `id`, exact repository/objective/issue, task and PR
+identifiers where known, exact current PR head where applicable, and a verb:
+`LAUNCH_TASK`, `RESUME_TASK`, `REPAIR_PR`, `RECOVER_OWNER`, or `VERIFY_MERGE`.
+The host worker may execute only that verb with its existing task tools and
+authorization checks. After the tool succeeds, run `ack --outbox <absolute-path>
+--id <id> --evidence '<task ID or other concrete result>'`. Acknowledgment is
+compare-and-set: an absent or superseded action cannot be acknowledged. The
+next scan verifies the action disappeared from live state; acknowledgment
+alone never completes the ticket. `VERIFY_MERGE` still requires exact-head
+independent review, required CI, repository merge rules, and human gates.
+
+No universal CLI adapter for the Codex task API is installed by this skill.
+In particular, LearnRise's `learnrise-code-exec` runs a coding turn
+synchronously and cannot serve as the existing `/boss` launch adapter, which
+expects a task ID within 120 seconds. Do not claim autonomous dispatch until
+the host has a tested asynchronous worker that consumes this outbox,
+deduplicates by action ID, records the real task ID, and acknowledges it.
