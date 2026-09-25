@@ -85,7 +85,7 @@ class OperationalStoreTests(unittest.TestCase):
         cmd = [sys.executable, str(SCRIPT), "--db", str(self.db), "dispatch", "--repo", str(self.repo), "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch", "--adapter", str(adapter)]
         failed = subprocess.run(cmd, env=env, text=True, capture_output=True)
         self.assertEqual(failed.returncode, 2)
-        self.assertIn("reservation remains", failed.stderr)
+        self.assertIn("remains for reconciliation", failed.stderr)
         retry = subprocess.run(cmd, env=env, text=True, capture_output=True)
         self.assertEqual(retry.returncode, 2)
         self.assertIn("already reserved", retry.stderr)
@@ -119,6 +119,39 @@ class OperationalStoreTests(unittest.TestCase):
         action = self.call(*self.command("status"))["actions"][0]
         self.assertEqual((action["status"], action["task_id"]), ("effect_verified", "task-14"))
 
+    def test_abandon_cannot_race_an_adapter_that_may_still_create_a_task(self):
+        claim = self.claim()
+        started, finish, created, calls = [self.root / name for name in ("started", "finish", "created.json", "calls")]
+        adapter = self.root / "slow-adapter"
+        adapter.write_text("#!/usr/bin/env python3\nimport json,os,sys,time\nr=json.load(sys.stdin)\nopen(os.environ['CALLS'],'a').write('called\\n')\nopen(os.environ['STARTED'],'w').write('yes')\nwhile not os.path.exists(os.environ['FINISH']): time.sleep(.02)\njson.dump({'id':'task-slow','action_id':r['action_id'],'status':'running'},open(os.environ['CREATED'],'w'))\nprint(json.dumps({'task_id':'task-slow'}))\n")
+        adapter.chmod(0o755)
+        env = os.environ.copy(); env.update(STARTED=str(started), FINISH=str(finish), CREATED=str(created), CALLS=str(calls))
+        cmd = [sys.executable, str(SCRIPT), "--db", str(self.db), "dispatch", "--repo", str(self.repo), "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch", "--adapter", str(adapter)]
+        process = subprocess.Popen(cmd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.time() + 10
+        while not started.exists() and time.time() < deadline:
+            time.sleep(.02)
+        self.assertTrue(started.exists(), "adapter did not start")
+        process.kill()
+        self.assertNotEqual(process.wait(timeout=10), 0, "dispatcher unexpectedly survived simulated crash")
+        action = self.call(*self.command("status"))["actions"][0]
+        inventory = self.inventory([])
+        abandon = subprocess.run([sys.executable, str(SCRIPT), "--db", str(self.db), *map(str, self.command("abandon", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", "1", "--action-id", action["action_id"], "--inventory", inventory, "--evidence", "Fresh empty inventory while adapter runs"))], text=True, capture_output=True)
+        self.assertEqual(abandon.returncode, 2, abandon.stderr)
+        self.assertIn("action dispatch is still in progress", abandon.stderr)
+        self.assertFalse(finish.exists())
+        finish.write_text("done")
+        out, err = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, -9, err)
+        deadline = time.time() + 10
+        while not created.exists() and time.time() < deadline:
+            time.sleep(.02)
+        self.assertTrue(created.exists(), f"adapter did not finish after dispatcher crash: {out!r} {err!r}")
+        task = json.loads(created.read_text())
+        self.call(*self.command("scan", "--inventory", self.inventory([task], "finished.json")))
+        self.assertEqual(calls.read_text().splitlines(), ["called"])
+        self.assertEqual(self.call(*self.command("status"))["actions"][0]["status"], "effect_verified")
+
     def test_missing_ack_and_missing_effect_are_durable_findings(self):
         claim = self.claim()
         reserved = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
@@ -133,7 +166,9 @@ class OperationalStoreTests(unittest.TestCase):
         claim = self.claim()
         reserved = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
         self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "task-14"))
-        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "task-14"), expected=2)
+        # Retrying the same CAS result is idempotent; conflicting task IDs are rejected.
+        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "task-14"))
+        self.call(*self.command("ack", "--issue", "14", "--phase", "implement", "--generation", str(claim["generation"]), "--action-id", reserved["action_id"], "--task-id", "other-task"), expected=2)
         absent = self.call(*self.command("scan", "--inventory", self.inventory([])))
         self.assertEqual(absent["actions"][0]["status"], "action_effect_missing")
         present = self.call(*self.command("scan", "--inventory", self.inventory([{"id": "task-14", "action_id": reserved["action_id"], "status": "running"}], "present.json")))

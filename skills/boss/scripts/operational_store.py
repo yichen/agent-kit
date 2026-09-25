@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Atomic per-repository claims and durable, fenced /boss actions."""
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -106,6 +108,25 @@ def begin(con):
     con.execute("BEGIN IMMEDIATE")
 
 
+@contextlib.contextmanager
+def action_guard(db_path, repo, issue, phase, verb, nonblocking=False):
+    key = hashlib.sha256(f"{repo}:{issue}:{phase}:{verb}".encode()).hexdigest()
+    lock_path = Path(db_path).with_name(f".action-{key}.lock")
+    handle = open(lock_path, "a+")
+    try:
+        flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+        try:
+            fcntl.flock(handle, flags)
+        except BlockingIOError:
+            raise ValueError("action dispatch is still in progress; cannot abandon")
+        yield handle
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def claim(con, repo, issue, phase, owner):
     begin(con)
     try:
@@ -169,25 +190,31 @@ def reserve(con, repo, issue, phase, owner, generation, verb):
         raise
 
 
-def abandon(con, repo, issue, phase, owner, generation, aid, inventory, evidence):
+def abandon(con, db_path, repo, issue, phase, owner, generation, aid, inventory, evidence):
     if not isinstance(evidence, str) or len(evidence.strip()) < 10 or len(evidence.strip()) > 500:
         raise ValueError("abandonment evidence must be 10-500 characters")
-    _, tasks = load_inventory(inventory)
-    if aid in tasks:
-        raise ValueError("cannot abandon: live inventory contains this action ID")
-    begin(con)
-    try:
-        active = con.execute("SELECT 1 FROM claims WHERE repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='active'", (repo, issue, phase, owner, generation)).fetchone()
-        if not active:
-            raise ValueError("stale generation: abandonment rejected")
-        changed = con.execute("UPDATE actions SET status='abandoned',last_effect='absent_at_abandonment' WHERE action_id=? AND repo=? AND issue=? AND phase=? AND generation=? AND status='reserved'", (aid, repo, issue, phase, generation)).rowcount
-        if not changed:
-            raise ValueError("abandonment compare-and-set failed")
-        event(con, repo, issue, phase, generation, aid, "action_abandoned", {"evidence": evidence.strip()})
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
+    with action_guard(db_path, repo, issue, phase, "launch", nonblocking=True):
+        as_of, tasks = load_inventory(inventory)
+        if aid in tasks:
+            raise ValueError("cannot abandon: live inventory contains this action ID")
+        begin(con)
+        try:
+            active = con.execute("SELECT 1 FROM claims WHERE repo=? AND issue=? AND phase=? AND owner=? AND generation=? AND status='active'", (repo, issue, phase, owner, generation)).fetchone()
+            if not active:
+                raise ValueError("stale generation: abandonment rejected")
+            row = con.execute("SELECT reserved_at FROM actions WHERE action_id=? AND repo=? AND issue=? AND phase=? AND generation=? AND status='reserved'", (aid, repo, issue, phase, generation)).fetchone()
+            if not row:
+                raise ValueError("abandonment compare-and-set failed")
+            reserved_at = dt.datetime.fromisoformat(row["reserved_at"].replace("Z", "+00:00"))
+            observed_at = dt.datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+            if observed_at <= reserved_at:
+                raise ValueError("abandonment inventory must be newer than the action reservation")
+            con.execute("UPDATE actions SET status='abandoned',last_effect='absent_at_abandonment' WHERE action_id=?", (aid,))
+            event(con, repo, issue, phase, generation, aid, "action_abandoned", {"evidence": evidence.strip(), "inventory_as_of": as_of})
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
 
 
 def acknowledge(con, repo, issue, phase, generation, aid, task_id):
@@ -199,8 +226,11 @@ def acknowledge(con, repo, issue, phase, generation, aid, task_id):
             raise ValueError("stale generation: acknowledgment rejected")
         changed = con.execute("UPDATE actions SET status='acknowledged',task_id=?,acknowledged_at=? WHERE action_id=? AND repo=? AND issue=? AND phase=? AND generation=? AND status='reserved'", (task_id, timestamp(), aid, repo, issue, phase, generation)).rowcount
         if not changed:
-            raise ValueError("acknowledgment compare-and-set failed")
-        event(con, repo, issue, phase, generation, aid, "action_acknowledged", {"task_id": task_id})
+            existing = con.execute("SELECT status,task_id FROM actions WHERE action_id=? AND repo=? AND issue=? AND phase=? AND generation=?", (aid, repo, issue, phase, generation)).fetchone()
+            if not existing or existing["status"] not in ("acknowledged", "effect_verified") or existing["task_id"] != task_id:
+                raise ValueError("acknowledgment compare-and-set failed")
+        else:
+            event(con, repo, issue, phase, generation, aid, "action_acknowledged", {"task_id": task_id})
         con.commit()
     except Exception:
         con.rollback()
@@ -314,25 +344,28 @@ def rebuild(con, repo, inventory):
     return scan(con, repo, inventory)
 
 
-def dispatch(con, repo, issue, phase, owner, generation, verb, adapter):
+def dispatch(con, db_path, repo, issue, phase, owner, generation, verb, adapter, context=None):
     executable = Path(adapter)
     if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
         raise ValueError("adapter must be an absolute executable file")
-    row, created = reserve(con, repo, issue, phase, owner, generation, verb)
-    if not created:
-        # The adapter may have created a session before its caller crashed. Never retry it.
-        raise ValueError(f"action already reserved ({row['status']}); reconcile by action ID before any retry")
-    request = {"repo": repo, "issue": issue, "phase": phase, "generation": generation, "owner": owner, "verb": verb, "action_id": row["action_id"]}
-    result = subprocess.run([str(executable)], input=json.dumps(request), capture_output=True, text=True, timeout=120)
-    if result.returncode:
-        raise ValueError(f"adapter failed; reservation remains for reconciliation: {result.stderr.strip()[:300]}")
-    try:
-        answer = json.loads(result.stdout)
-        task_id = valid_id(answer["task_id"], "task ID")
-    except (KeyError, TypeError, json.JSONDecodeError):
-        raise ValueError("adapter returned no valid task_id; reservation remains for reconciliation")
-    acknowledge(con, repo, issue, phase, generation, row["action_id"], task_id)
-    return {"action_id": row["action_id"], "task_id": task_id, "status": "acknowledged"}
+    with action_guard(db_path, repo, issue, phase, verb) as guard:
+        row, created = reserve(con, repo, issue, phase, owner, generation, verb)
+        if not created:
+            # The adapter may have created a session before its caller crashed. Never retry it.
+            raise ValueError(f"action already reserved ({row['status']}); reconcile action {row['action_id']} before any retry")
+        request = {"repo": repo, "issue": issue, "phase": phase, "generation": generation, "owner": owner, "verb": verb, "action_id": row["action_id"]}
+        if context:
+            request.update(context)
+        result = subprocess.run([str(executable)], input=json.dumps(request), capture_output=True, text=True, timeout=120, pass_fds=(guard.fileno(),))
+        if result.returncode:
+            raise ValueError(f"adapter failed; reservation {row['action_id']} remains for reconciliation: {result.stderr.strip()[:300]}")
+        try:
+            answer = json.loads(result.stdout)
+            task_id = valid_id(answer["task_id"], "task ID")
+        except (KeyError, TypeError, json.JSONDecodeError):
+            raise ValueError(f"adapter returned no valid task_id; reservation {row['action_id']} remains for reconciliation")
+        acknowledge(con, repo, issue, phase, generation, row["action_id"], task_id)
+        return {"action_id": row["action_id"], "task_id": task_id, "status": "acknowledged"}
 
 
 def main():
@@ -354,6 +387,8 @@ def main():
     sub.choices["dispatch"].add_argument("--generation", type=int, required=True)
     sub.choices["dispatch"].add_argument("--verb", required=True)
     sub.choices["dispatch"].add_argument("--adapter", required=True)
+    sub.choices["dispatch"].add_argument("--kind", choices=("feature", "testability"))
+    sub.choices["dispatch"].add_argument("--master")
     sub.choices["ack"].add_argument("--generation", type=int, required=True)
     sub.choices["ack"].add_argument("--action-id", required=True)
     sub.choices["ack"].add_argument("--task-id", required=True)
@@ -393,7 +428,10 @@ def main():
             if args.generation <= 0:
                 raise ValueError("generation must be positive")
             valid_id(args.verb, "verb")
-            result = dispatch(con, repo, args.issue, args.phase, args.owner, args.generation, args.verb, args.adapter)
+            context = {key: value for key, value in (("kind", args.kind), ("master", args.master)) if value is not None}
+            if args.master:
+                valid_id(args.master, "master")
+            result = dispatch(con, args.db, repo, args.issue, args.phase, args.owner, args.generation, args.verb, args.adapter, context)
         elif args.command == "ack":
             if args.generation <= 0:
                 raise ValueError("generation must be positive")
@@ -402,7 +440,7 @@ def main():
         elif args.command == "abandon":
             if args.generation <= 0:
                 raise ValueError("generation must be positive")
-            abandon(con, repo, args.issue, args.phase, args.owner, args.generation, args.action_id, args.inventory, args.evidence)
+            abandon(con, args.db, repo, args.issue, args.phase, args.owner, args.generation, args.action_id, args.inventory, args.evidence)
             result = {"abandoned": True, "action_id": args.action_id}
         elif args.command == "scan":
             result = scan(con, repo, args.inventory)
