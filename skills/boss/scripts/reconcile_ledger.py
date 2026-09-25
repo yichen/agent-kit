@@ -59,13 +59,25 @@ def load_inputs(ledger_path, tasks_path, now):
             raise ReconcileError("invalid or duplicate task observation")
         task_map[task["id"]] = task
     rows = ledger.get("objectives")
-    if not isinstance(rows, list) or len({row.get("id") for row in rows if isinstance(row, dict)}) != len(rows):
+    if not isinstance(rows, list) or any(not isinstance(row, dict) or not isinstance(row.get("id"), str) for row in rows):
+        raise ReconcileError("invalid or duplicate objective")
+    ids = [row["id"] for row in rows]
+    if len(set(ids)) != len(ids):
         raise ReconcileError("invalid or duplicate objective")
     for row in rows:
-        if not isinstance(row, dict):
-            raise ReconcileError("invalid objective")
         if row.get("work_item"):
             fresh(row.get("last_checked_utc"), now)
+    open_prs = ledger.get("open_pull_requests")
+    if open_prs is not None:
+        if not isinstance(open_prs, list):
+            raise ReconcileError("open pull request inventory must be a list")
+        numbers = []
+        for item in open_prs:
+            if not isinstance(item, dict) or type(item.get("number")) is not int or item["number"] < 1:
+                raise ReconcileError("invalid open pull request observation")
+            numbers.append(item["number"])
+        if len(set(numbers)) != len(numbers):
+            raise ReconcileError("duplicate open pull request observation")
     return ledger, task_map
 
 
@@ -89,16 +101,157 @@ def action(repo, row, verb, *, task_id=None, pr=None, head=None, reason=None):
             "reason": reason or verb}
 
 
-def decide(ledger, tasks):
+def pr_action(repo, number, verb, *, head=None, objective=None, reason=None):
+    if not isinstance(head, str) or not SHA.fullmatch(head):
+        head = None
+    row = {"id": f"PR #{number}", "issue_number": None,
+           "pull_requests": [number]}
+    result = action(repo, row, verb, pr=number, head=head, reason=reason)
+    result["objective"] = objective or row["id"]
+    return result
+
+
+def pr_status(repo, row, number, observation, task_id, tasks, now):
+    """Return one action/wait for an OPEN PR, without consulting issue gates."""
+    rid = row["id"]
+    head = observation.get("head") if isinstance(observation, dict) else None
+    if not isinstance(head, str) or not SHA.fullmatch(head):
+        raise ReconcileError(f"{rid}: current PR head missing or malformed")
+    merge = observation.get("merge")
+    if merge == "DIRTY":
+        verb = "REPAIR_PR" if task_id and task_id in tasks else "RECOVER_OWNER"
+        return action(repo, row, verb, task_id=task_id, pr=number, head=head,
+                      reason="current PR has a merge conflict"), None
+    if merge != "CLEAN":
+        return None, {"objective": rid, "reason": "pr_mergeability_unknown", "pr": number, "head": head}
+
+    required = observation.get("required_checks")
+    checks = observation.get("checks")
+    if (not isinstance(required, list) or not required or
+            any(not isinstance(name, str) or not name.strip() for name in required) or
+            len(set(required)) != len(required) or not isinstance(checks, list)):
+        return action(repo, row, "RECOVER_OWNER", task_id=task_id, pr=number, head=head,
+                      reason="required exact-head CI contexts are missing or malformed"), None
+
+    by_name = {}
+    for check in checks:
+        if (not isinstance(check, dict) or not isinstance(check.get("name"), str) or
+                check.get("state") not in ("SUCCESS", "FAILURE", "PENDING") or
+                not isinstance(check.get("head"), str) or not SHA.fullmatch(check["head"])):
+            raise ReconcileError(f"{rid}: malformed current-head check observation")
+        by_name.setdefault(check["name"], []).append(check)
+
+    missing = [name for name in required if len(by_name.get(name, [])) != 1]
+    stale, failed, pending, wrong_head = [], [], [], []
+    for name in required:
+        observations = by_name.get(name, [])
+        if len(observations) != 1:
+            continue
+        check = observations[0]
+        if check["head"] != head:
+            wrong_head.append(name)
+        if check["state"] == "FAILURE":
+            failed.append(name)
+        elif check["state"] == "PENDING":
+            started = check.get("started_at")
+            if started is None:
+                stale.append(name)
+            else:
+                age = now - timestamp(started)
+                if age < -timedelta(minutes=2) or age > timedelta(minutes=45):
+                    stale.append(name)
+                else:
+                    pending.append(name)
+    if failed or stale or wrong_head:
+        verb = "REPAIR_PR" if task_id and task_id in tasks else "RECOVER_OWNER"
+        reason = "required current-head CI failed, is stale, or belongs to another head"
+        return action(repo, row, verb, task_id=task_id, pr=number, head=head, reason=reason), None
+    if missing:
+        return action(repo, row, "RECOVER_OWNER", task_id=task_id, pr=number, head=head,
+                      reason="required CI context is absent or duplicated"), None
+    if pending:
+        return None, {"objective": rid, "reason": "required_pr_checks_pending", "pr": number,
+                      "head": head, "contexts": pending}
+    return action(repo, row, "VERIFY_MERGE", task_id=task_id, pr=number, head=head,
+                  reason="verify independent current-head review and repository merge rules; this does not authorize merge"), None
+
+
+def decide(ledger, tasks, now=None):
+    now = now or datetime.now(UTC)
     repo = ledger["repository"]
     rows = {row["id"]: row for row in ledger["objectives"]}
     edges = ledger.get("dependency_edges", [])
     gates = {gate["id"]: gate for gate in ledger.get("dependency_gates", [])}
     actions, waiting = [], []
+    # Reconcile every observed OPEN PR before any issue-level completion,
+    # dispatch hold, dependency, or human gate can hide it.
+    owners = {}
+    prequarantined = ledger.get("quarantined_objective_ids") or []
+    if not isinstance(prequarantined, list) or any(not isinstance(value, str) for value in prequarantined):
+        raise ReconcileError("malformed quarantined objective IDs")
+    quarantined_objectives = set(prequarantined)
+    for row in ledger["objectives"]:
+        for number in row.get("pull_requests") or []:
+            if row.get("pull_request_states", {}).get(str(number)) == "OPEN":
+                owners.setdefault(number, []).append(row)
+    inventory = ledger.get("open_pull_requests")
+    if inventory is not None:
+        if not isinstance(inventory, list):
+            raise ReconcileError("open pull request inventory must be a list")
+        observed_numbers = set()
+        for item in inventory:
+            if (not isinstance(item, dict) or type(item.get("number")) is not int or
+                    item["number"] < 1 or item["number"] in observed_numbers):
+                raise ReconcileError("invalid or duplicate open pull request observation")
+            observed_numbers.add(item["number"])
+            number = item["number"]
+            candidates = item.get("candidate_objectives", [])
+            if not isinstance(candidates, list) or any(not isinstance(value, str) for value in candidates):
+                raise ReconcileError(f"PR #{number}: malformed quarantine candidates")
+            quarantined_objectives.update(candidates)
+            matches = owners.get(number, [])
+            if item.get("quarantine_reason") is not None or len(matches) != 1 or (item.get("objective") is not None and
+                                    item.get("objective") != matches[0]["id"]):
+                actions.append(pr_action(repo, number, "QUARANTINE_PR", head=item.get("head"),
+                                         reason=item.get("quarantine_reason") or
+                                         "open PR is untracked or has ambiguous ownership"))
+                continue
+            row = matches[0]
+            task_id = row.get("coding_task_id") or row.get("implementation_thread_id") or row.get("active_task_uuid")
+            observation = item.get("observation", item)
+            result, wait = pr_status(repo, row, number, observation, task_id, tasks, now)
+            if result:
+                actions.append(result)
+            if wait:
+                waiting.append(wait)
+        for number, rows_for_pr in owners.items():
+            if number not in observed_numbers:
+                actions.append(pr_action(repo, number, "QUARANTINE_PR",
+                                         reason="ledger marks PR open but fresh PR inventory omitted it"))
+    else:
+        # Backward-compatible ledger observations still receive PR-first handling.
+        for number, rows_for_pr in owners.items():
+            if len(rows_for_pr) != 1:
+                actions.append(pr_action(repo, number, "QUARANTINE_PR",
+                                         reason="open PR has ambiguous ownership"))
+                continue
+            row = rows_for_pr[0]
+            task_id = row.get("coding_task_id") or row.get("implementation_thread_id") or row.get("active_task_uuid")
+            observation = (row.get("pr_observations") or {}).get(str(number))
+            result, wait = pr_status(repo, row, number, observation, task_id, tasks, now)
+            if result:
+                actions.append(result)
+            if wait:
+                waiting.append(wait)
     for row in ledger["objectives"]:
         if not row.get("work_item") or complete(row):
             continue
         rid = row["id"]
+        if any(row in candidates for candidates in owners.values()):
+            continue
+        if rid in quarantined_objectives:
+            waiting.append({"objective": rid, "reason": "quarantined_pr_candidate"})
+            continue
         hold = row.get("dispatch_hold")
         if hold is not None:
             if not isinstance(hold, dict) or not isinstance(hold.get("reason"), str) or not hold["reason"]:
@@ -129,25 +282,6 @@ def decide(ledger, tasks):
         task_id = row.get("coding_task_id") or row.get("implementation_thread_id") or row.get("active_task_uuid")
         prs = row.get("pull_requests") or []
         states = row.get("pull_request_states") or {}
-        open_prs = [pr for pr in prs if states.get(str(pr)) == "OPEN"]
-        if len(open_prs) > 1:
-            raise ReconcileError(f"{rid}: multiple open PRs need explicit phase ownership")
-        if open_prs:
-            pr = open_prs[0]
-            obs = (row.get("pr_observations") or {}).get(str(pr))
-            if not isinstance(obs, dict) or not SHA.fullmatch(str(obs.get("head", ""))):
-                raise ReconcileError(f"{rid}: current PR head missing")
-            head = obs["head"]
-            if obs.get("merge") == "DIRTY" or obs.get("failed_checks"):
-                verb = "REPAIR_PR" if task_id and task_id in tasks else "RECOVER_OWNER"
-                actions.append(action(repo, row, verb, task_id=task_id, pr=pr, head=head,
-                                      reason="conflict or current-head CI failure"))
-            elif obs.get("merge") == "CLEAN" and obs.get("check_count", 0) > 0 and obs.get("passed_count", 0) > 0 and not obs.get("pending_checks"):
-                actions.append(action(repo, row, "VERIFY_MERGE", task_id=task_id, pr=pr, head=head,
-                                      reason="review only: verify required exact-head contexts and independent current-head review; this action does not authorize merge"))
-            else:
-                waiting.append({"objective": rid, "reason": "pr_checks_pending_or_unknown", "pr": pr, "head": head})
-            continue
         if prs and all(states.get(str(pr)) == "MERGED" for pr in prs):
             # Code is already merged. An open issue can still require rollout,
             # acceptance, or explicit closure; never launch duplicate coding.
@@ -274,7 +408,7 @@ def main(argv=None):
     if not args.ledger or not args.tasks:
         raise ReconcileError("--ledger and --tasks are required")
     ledger, tasks = load_inputs(args.ledger, args.tasks, instant)
-    actions, waiting = decide(ledger, tasks)
+    actions, waiting = decide(ledger, tasks, instant)
     overdue = []
     if args.command == "scan":
         if not args.outbox:

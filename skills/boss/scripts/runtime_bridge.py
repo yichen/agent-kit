@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import nullcontext
+from urllib.parse import quote
 
 import reconcile_ledger as reconcile
 
@@ -187,6 +188,136 @@ def discover_open_prs(ledger: dict, prs: list[dict]) -> list[tuple[str, int]]:
     return additions
 
 
+def classify_open_prs(ledger: dict, prs: list[dict]) -> tuple[list[tuple[str, int]], list[dict]]:
+    """Link only unambiguous PRs; preserve every other open PR as quarantine."""
+    discover_open_prs(ledger, [])  # validate ownership data before classifying per-PR ambiguity
+    additions, quarantined = [], []
+    seen = set()
+    if not isinstance(prs, list):
+        raise BridgeError("malformed open PR inventory")
+    for pr in prs:
+        if not isinstance(pr, dict) or type(pr.get("number")) is not int or pr["number"] < 1 or pr.get("state") != "OPEN":
+            raise BridgeError("malformed open PR inventory")
+        number = pr["number"]
+        if number in seen:
+            raise BridgeError("duplicate open PR inventory item")
+        seen.add(number)
+        try:
+            linked = discover_open_prs(ledger, [pr])
+        except BridgeError as exc:
+            tracked = {row.get("issue_number") for row in ledger["objectives"]
+                       if row.get("work_item") and type(row.get("issue_number")) is int}
+            text = " ".join(pr.get(key) or "" for key in ("body", "title", "headRefName"))
+            candidates = sorted({int(value) for value in WEAK_REF.findall(text)} & tracked)
+            quarantined.append({"number": number, "reason": str(exc),
+                                "candidate_objectives": sorted(row["id"] for row in ledger["objectives"]
+                                                               if row.get("work_item") and row.get("issue_number") in candidates)})
+            continue
+        if linked:
+            additions.extend(linked)
+            continue
+        matches = [row for row in ledger["objectives"] if number in row.get("pull_requests", [])]
+        if len(matches) == 1:
+            # discover_open_prs succeeded and confirmed any live references agree.
+            continue
+        elif len(matches) > 1:
+            quarantined.append({"number": number, "reason": "PR is linked to multiple objectives",
+                                "candidate_objectives": [row["id"] for row in matches]})
+        else:
+            quarantined.append({"number": number, "reason": "open PR has no unambiguous tracked issue owner"})
+    return additions, quarantined
+
+
+def current_pr_observations(repo: str, ledger: dict, prs: list[dict], additions: list[tuple[str, int]], quarantined: list[dict], *, fixtures: bool) -> list[dict]:
+    owners = {number: objective for objective, number in additions}
+    for row in ledger["objectives"]:
+        for number in row.get("pull_requests", []):
+            if number in {pr["number"] for pr in prs}:
+                owners.setdefault(number, row["id"])
+    quarantined_by_number = {item["number"]: item for item in quarantined}
+    observations = []
+    for pr in prs:
+        number = pr["number"]
+        head = pr.get("headRefOid")
+        if fixtures:
+            required = pr.get("requiredChecks")
+            raw_checks = pr.get("requiredCheckObservations")
+            mergeable = pr.get("mergeable")
+        else:
+            if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+                raise BridgeError(f"PR #{number}: current head missing")
+            result = run(["gh", "pr", "checks", "--repo", repo, str(number), "--required",
+                          "--json", "name,state,startedAt"])
+            no_required_reported = (result.returncode == 1 and
+                                    re.fullmatch(r"no required checks reported on the '.+' branch\s*", result.stderr.strip()) is not None)
+            if no_required_reported:
+                # Preserve the PR and its ordinary check state even when no
+                # required-check policy is configured. The independent policy
+                # lookup below will leave required empty and block verification.
+                result = run(["gh", "pr", "checks", "--repo", repo, str(number),
+                              "--json", "name,state,startedAt"])
+            if result.returncode not in (0, 8):
+                raise BridgeError(f"PR #{number}: required check inventory failed: {result.stderr.strip()}")
+            try:
+                raw_checks = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise BridgeError(f"PR #{number}: malformed required check inventory") from exc
+            verified = run(["gh", "pr", "view", "--repo", repo, str(number), "--json", "headRefOid"])
+            if verified.returncode:
+                raise BridgeError(f"PR #{number}: cannot verify current head after check inventory")
+            try:
+                verified_head = json.loads(verified.stdout).get("headRefOid")
+            except (json.JSONDecodeError, AttributeError) as exc:
+                raise BridgeError(f"PR #{number}: malformed post-check head observation") from exc
+            if verified_head != head:
+                raise BridgeError(f"PR #{number}: head changed during check inventory; retry scan")
+            required = required_contexts(repo, pr.get("baseRefName"))
+            mergeable = pr.get("mergeable")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise BridgeError(f"PR #{number}: current head missing")
+        checks = []
+        if raw_checks is not None:
+            if not isinstance(raw_checks, list):
+                raise BridgeError(f"PR #{number}: malformed required check inventory")
+            for check in raw_checks:
+                if not isinstance(check, dict) or not isinstance(check.get("name"), str):
+                    raise BridgeError(f"PR #{number}: malformed required check")
+                raw_state = check.get("state")
+                if raw_state == "SUCCESS":
+                    state = "SUCCESS"
+                elif raw_state in ("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"):
+                    state = "PENDING"
+                elif raw_state in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "SKIPPED", "NEUTRAL"):
+                    state = "FAILURE"
+                else:
+                    state = None
+                if state is None:
+                    raise BridgeError(f"PR #{number}: unknown required check state")
+                checks.append({"name": check["name"], "head": head, "state": state,
+                               "started_at": check.get("startedAt")})
+        quarantine = quarantined_by_number.get(number, {})
+        observations.append({"number": number, "objective": owners.get(number),
+                             "quarantine_reason": quarantine.get("reason"),
+                             "candidate_objectives": quarantine.get("candidate_objectives", []), "head": head,
+                             "merge": {"MERGEABLE": "CLEAN", "CONFLICTING": "DIRTY"}.get(mergeable, "UNKNOWN"),
+                             "observation": {"head": head,
+                                             "merge": {"MERGEABLE": "CLEAN", "CONFLICTING": "DIRTY"}.get(mergeable, "UNKNOWN"),
+                                             "required_checks": required or [], "checks": checks}})
+    return observations
+
+
+def project_pr_observations(ledger: dict, observations: list[dict]) -> dict:
+    projected = json.loads(json.dumps(ledger))
+    projected["open_pull_requests"] = observations
+    projected["quarantined_objective_ids"] = sorted({objective for item in observations
+                                                       for objective in item.get("candidate_objectives", [])})
+    for item in observations:
+        if item.get("objective"):
+            row = next(row for row in projected["objectives"] if row["id"] == item["objective"])
+            row.setdefault("pull_request_states", {})[str(item["number"])] = "OPEN"
+    return projected
+
+
 def atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".boss-runtime-", dir=path.parent)
@@ -212,6 +343,58 @@ def project_prs(ledger: dict, additions: list[tuple[str, int]]) -> dict:
             prs.append(number)
             prs.sort()
     return projected
+
+
+def required_contexts(repo: str, branch: str) -> list[str]:
+    """Read configured required context names independently from check results."""
+    if not isinstance(branch, str) or not branch:
+        raise BridgeError("PR base branch is missing")
+    encoded_branch = quote(branch, safe="")
+    result = run(["gh", "api", f"repos/{repo}/rules/branches/{encoded_branch}?per_page=100"])
+    if result.returncode:
+        raise BridgeError(f"cannot read active branch rules for {branch}: {result.stderr.strip()}")
+    try:
+        rules = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"malformed active branch rules for {branch}") from exc
+    if not isinstance(rules, list) or len(rules) >= 100:
+        raise BridgeError(f"active branch rules for {branch} are malformed or truncated")
+    contexts = set()
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise BridgeError(f"malformed active branch rule for {branch}")
+        if rule.get("type") != "required_status_checks":
+            continue
+        params = rule.get("parameters")
+        required = params.get("required_status_checks") if isinstance(params, dict) else None
+        if not isinstance(required, list) or any(not isinstance(item, dict) or
+                                                  not isinstance(item.get("context"), str) or
+                                                  not item["context"] for item in required):
+            raise BridgeError(f"malformed required status check rule for {branch}")
+        contexts.update(item["context"] for item in required)
+
+    protected = run(["gh", "api", f"repos/{repo}/branches/{encoded_branch}/protection/required_status_checks"])
+    if protected.returncode:
+        if "404" not in protected.stderr:
+            raise BridgeError(f"cannot read branch protection checks for {branch}: {protected.stderr.strip()}")
+    else:
+        try:
+            protection = json.loads(protected.stdout)
+        except json.JSONDecodeError as exc:
+            raise BridgeError(f"malformed branch protection checks for {branch}") from exc
+        if not isinstance(protection, dict):
+            raise BridgeError(f"malformed branch protection checks for {branch}")
+        legacy = protection.get("contexts", [])
+        checks = protection.get("checks", [])
+        if not isinstance(legacy, list) or any(not isinstance(name, str) or not name for name in legacy):
+            raise BridgeError(f"malformed branch protection contexts for {branch}")
+        if not isinstance(checks, list) or any(not isinstance(item, dict) or
+                                                not isinstance(item.get("context"), str) or
+                                                not item["context"] for item in checks):
+            raise BridgeError(f"malformed branch protection check rules for {branch}")
+        contexts.update(legacy)
+        contexts.update(item["context"] for item in checks)
+    return sorted(contexts)
 
 
 def carry_observed_prs(canonical: dict, previous: dict) -> dict:
@@ -275,7 +458,7 @@ def main(argv=None) -> int:
             prs = json.loads(args.prs_file.read_text())
         else:
             result = run(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "1000",
-                          "--json", "number,state,title,body,headRefName"])
+                          "--json", "number,state,title,body,headRefName,headRefOid,mergeable"])
             if result.returncode:
                 raise BridgeError(f"GitHub open PR inventory failed: {result.stderr.strip()}")
             prs = json.loads(result.stdout)
@@ -283,9 +466,12 @@ def main(argv=None) -> int:
             raise BridgeError("PR inventory malformed or truncated")
         observed_ledger = args.tasks.with_name("boss-observed-ledger.json")
         basis = carry_observed_prs(repo_data, json.loads(observed_ledger.read_text())) if observed_ledger.exists() else repo_data
-        additions = discover_open_prs(basis, prs)
+        additions, quarantined = classify_open_prs(basis, prs)
+        pr_observations = current_pr_observations(repo, basis, prs, additions, quarantined,
+                                                   fixtures=bool(args.prs_file))
+        projection = project_pr_observations(project_prs(basis, additions), pr_observations)
         if not args.dry_run:
-            atomic_json(observed_ledger, project_prs(basis, additions))
+            atomic_json(observed_ledger, projection)
             if not args.skip_audit:
                 audited = run([sys.executable, str(args.audit), str(observed_ledger)])
                 flags = [line[6:] for line in audited.stdout.splitlines() if line.startswith("FLAG: ")]
@@ -297,7 +483,7 @@ def main(argv=None) -> int:
                 if known_gaps:
                     print("boss runtime: audit found owner/heartbeat gaps; continuing with fresh GitHub observations", file=sys.stderr)
             require_unchanged(args.ledger, source_bytes)
-        ledger = json.loads(observed_ledger.read_text()) if not args.dry_run else basis
+        ledger = json.loads(observed_ledger.read_text()) if not args.dry_run else projection
         if args.processes_file:
             processes = args.processes_file.read_text()
         else:
@@ -309,10 +495,12 @@ def main(argv=None) -> int:
         if args.dry_run:
             if additions:
                 print(json.dumps({"actions": [], "inventory": tasks, "pr_additions": additions,
+                                  "quarantined_prs": quarantined,
                                   "decision_skipped": "new PR links require a fresh audit before deciding"}))
                 return 0
             actions, waiting = reconcile.decide(ledger, {item["id"]: item for item in tasks["tasks"]})
-            print(json.dumps({"actions": actions, "waiting": waiting, "inventory": tasks, "pr_additions": additions}))
+            print(json.dumps({"actions": actions, "waiting": waiting, "inventory": tasks, "pr_additions": additions,
+                              "quarantined_prs": quarantined}))
             return 0
         atomic_json(args.tasks, tasks)
         require_unchanged(args.ledger, source_bytes)
@@ -321,7 +509,8 @@ def main(argv=None) -> int:
         if result.returncode not in (0, 3):
             raise BridgeError(f"reconciler failed: {result.stdout} {result.stderr}")
         report = json.loads(result.stdout)
-        print(json.dumps({"inventory": tasks, "pr_additions": additions, **report}, sort_keys=True))
+        print(json.dumps({"inventory": tasks, "pr_additions": additions,
+                          "quarantined_prs": quarantined, **report}, sort_keys=True))
         if report["actions"]:
             if args.hub_task:
                 require_unchanged(args.ledger, source_bytes)
