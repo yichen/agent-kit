@@ -25,7 +25,7 @@ expect_fail() {
     echo "unexpected success: $*" >&2
     exit 1
   fi
-  rg -q "$expected" "$ROOT/err"
+  grep -q "$expected" "$ROOT/err"
 }
 
 # No-write guard: read-only commands neither initialize state nor call a launcher.
@@ -38,7 +38,7 @@ if env -u BOSS_TEST_MODE python3 "$BOSS" --prs-file "$PRS" status --repo "$REPO"
   echo 'fixture override worked outside test mode' >&2
   exit 1
 fi
-rg -q 'explicit local test mode' "$ROOT/fixture-err"
+grep -q 'explicit local test mode' "$ROOT/fixture-err"
 run init --repo "$REPO" --master boss-A --hub hub-A > /dev/null
 expect_fail 'different boss master' init --repo "$REPO" --master boss-B
 OTHER="$ROOT/other-checkout"
