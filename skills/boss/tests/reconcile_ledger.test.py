@@ -118,7 +118,9 @@ class ReconcileTests(unittest.TestCase):
             self.assertEqual(mod.sync_outbox(outbox, [action], NOW + timedelta(minutes=17)), [])
             self.assertEqual(mod.sync_outbox(outbox, [action], NOW + timedelta(minutes=32)), [action["id"]])
             mod.sync_outbox(outbox, [], NOW + timedelta(minutes=33))
-            self.assertEqual(json.loads(outbox.read_text())["actions"][action["id"]]["state"], "acknowledged")
+            self.assertEqual(json.loads(outbox.read_text())["actions"][action["id"]]["state"], "resolved")
+            self.assertEqual(mod.sync_outbox(outbox, [action], NOW + timedelta(minutes=34)), [])
+            self.assertEqual(json.loads(outbox.read_text())["actions"][action["id"]]["state"], "pending")
             for bad in ("bad", "a" * 24):
                 with self.assertRaises(mod.ReconcileError):
                     mod.acknowledge(outbox, bad, "different evidence", NOW)

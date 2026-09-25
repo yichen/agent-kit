@@ -202,6 +202,8 @@ def sync_outbox(path, actions, instant, cycle_minutes=15):
         overdue = []
         for item in actions:
             record = data["actions"].setdefault(item["id"], {"action": item, "state": "pending", "first_seen": instant.isoformat()})
+            if record["state"] in ("superseded", "resolved"):
+                record.update(state="pending", first_seen=instant.isoformat())
             if record["state"] == "pending" and instant - timestamp(record["first_seen"]) > timedelta(minutes=cycle_minutes):
                 overdue.append(item["id"])
             if record["state"] == "acknowledged" and instant - timestamp(record["acknowledged_at"]) > timedelta(minutes=cycle_minutes):
@@ -212,6 +214,9 @@ def sync_outbox(path, actions, instant, cycle_minutes=15):
             if aid not in current and record["state"] == "pending":
                 record["state"] = "superseded"
                 record["superseded_at"] = instant.isoformat()
+            elif aid not in current and record["state"] == "acknowledged":
+                record["state"] = "resolved"
+                record["resolved_at"] = instant.isoformat()
         atomic_write(path, data)
     return overdue
 
