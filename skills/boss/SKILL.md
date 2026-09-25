@@ -75,3 +75,57 @@ synchronously and cannot serve as the existing `/boss` launch adapter, which
 expects a task ID within 120 seconds. Do not claim autonomous dispatch until
 the host has a tested asynchronous worker that consumes this outbox,
 deduplicates by action ID, records the real task ID, and acknowledges it.
+
+### Host runtime bridge
+
+`scripts/runtime_bridge.py` is the 15-minute host entry point for a legacy
+LearnRise ledger. It reads open GitHub PRs, attaches only unambiguous `Closes
+#N`/`Fixes #N`/`Resolves #N` links to the exact `#N` objective, refreshes the
+ledger with its repository audit, builds a task inventory from the local Codex
+catalog and rollout files, checks for live `codex exec resume --json <UUID>`
+writer processes, then invokes `reconcile_ledger.py scan`. A live writer wins
+over an earlier `task_complete`/`interrupted` record. Missing catalog entries,
+ambiguous PR links, malformed rollouts, audit failures, and stale observations
+fail closed. It never decides that a PR is safe to merge.
+
+The bridge has no safe noninteractive API for creating desktop Codex tasks. Its
+`--hub-task` option queues structured action IDs to an existing monitoring hub
+with `codex queue`, then exits 3 while actions remain. This is an alert and
+handoff, **not** automatic repair or task launch. The hub must execute the
+action with its task tools, verify the returned task/PR ID, and call the
+reconciler's `ack` command. If the action stays unchanged after 15 minutes,
+the outbox remains overdue. Never report this installation as fully autonomous.
+
+After this version is installed on the host, use a 15-minute launchd job or
+equivalent host scheduler. Example command (replace home path and monitoring
+hub UUID with verified values):
+
+```sh
+python3 "$HOME/.codex/skills/boss/scripts/runtime_bridge.py" \
+  --ledger "$HOME/agents-artifacts/learnrise-orchestrator/ownership.json" \
+  --audit "$HOME/agents-artifacts/learnrise-orchestrator/audit.py" \
+  --state-db "$HOME/.codex/state_5.sqlite" \
+  --tasks "$HOME/agents-artifacts/learnrise-orchestrator/codex-tasks.json" \
+  --outbox "$HOME/agents-artifacts/learnrise-orchestrator/boss-outbox.json" \
+  --hub-task '<verified-hub-uuid>'
+```
+
+Schedule every 900 seconds. Capture stdout and stderr in host logs and alert
+on exits 2 or 3; `StartInterval` alone does not surface failures to a human.
+For the current LearnRise host, the checked-in
+`examples/com.yichen.boss.learnrise.plist` shows the exact paths and 900-second
+schedule. Review its hub UUID against the live monitoring task, copy it to
+`$HOME/Library/LaunchAgents/com.yichen.boss.learnrise.plist`, validate with
+`plutil -lint`, then run `launchctl bootstrap gui/$(id -u)
+$HOME/Library/LaunchAgents/com.yichen.boss.learnrise.plist`. Run
+`launchctl print gui/$(id -u)/com.yichen.boss.learnrise` to verify it loaded;
+inspect the stdout/stderr logs and a live scan before declaring it deployed.
+The example must not be loaded before this code is merged and host skill
+installation is updated.
+Do not run a second bridge for the same outbox; the bridge uses a host lock,
+and ledger PR attachment uses compare-and-set. Use `--dry-run --skip-audit
+--prs-file <fixture> --processes-file <fixture>` for no-write local canaries.
+Verify a live run after installation: fresh GitHub audit, current task status,
+exact PR link, durable outbox, and monitoring-hub receipt. The local Codex
+catalog applies only to tasks on this host; remote task IDs fail closed until
+a supported remote inventory adapter exists.
