@@ -350,6 +350,67 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         self.assertEqual(headers["sec-websocket-version"], "13")
         self.assertEqual(len(base64.b64decode(headers["sec-websocket-key"])), 16)
 
+    def test_thread_list_uses_bounded_read_only_pages_for_large_inventories_table(self):
+        for row_count in (0, 1, adapter.THREAD_LIST_PAGE_SIZE, adapter.THREAD_LIST_PAGE_SIZE + 1, 257):
+            with self.subTest(row_count=row_count):
+                server = object.__new__(adapter.AppServer)
+                requests = []
+
+                def call(method, params):
+                    self.assertEqual(method, "thread/list")
+                    requests.append({"method": method, **params})
+                    cursor = params.get("cursor")
+                    offset = int(cursor.removeprefix("page-")) if cursor else 0
+                    data = [{"id": str(index)} for index in range(offset, min(offset + adapter.THREAD_LIST_PAGE_SIZE, row_count))]
+                    next_offset = offset + len(data)
+                    next_cursor = f"page-{next_offset}" if next_offset < row_count else None
+                    return {"data": data, "nextCursor": next_cursor}
+
+                server.call = call
+                rows = server.threads()
+                self.assertEqual([item["id"] for item in rows], [str(index) for index in range(row_count)])
+                self.assertEqual(len(requests), max(1, (row_count + adapter.THREAD_LIST_PAGE_SIZE - 1) // adapter.THREAD_LIST_PAGE_SIZE))
+                self.assertEqual([item.get("cursor") for item in requests],
+                                 [None] + [f"page-{offset}" for offset in range(adapter.THREAD_LIST_PAGE_SIZE,
+                                                                               row_count,
+                                                                               adapter.THREAD_LIST_PAGE_SIZE)])
+                for params in requests:
+                    self.assertEqual(params["limit"], adapter.THREAD_LIST_PAGE_SIZE)
+                    self.assertEqual(params["sortKey"], "created_at")
+                    self.assertEqual(params["sortDirection"], "desc")
+                    self.assertIs(params["useStateDbOnly"], True)
+                self.assertTrue(all(request["method"] == "thread/list" for request in requests))
+
+    def test_thread_list_rejects_malformed_pages_and_unbounded_cursor_chains_table(self):
+        cases = [
+            ("missing data", [{"nextCursor": None}], "malformed thread/list page"),
+            ("non-list data", [{"data": {}, "nextCursor": None}], "malformed thread/list page"),
+            ("page exceeds requested size", [{"data": [{}] * (adapter.THREAD_LIST_PAGE_SIZE + 1)}], "malformed thread/list page"),
+            ("non-string cursor", [{"data": [], "nextCursor": 7}], "malformed thread/list cursor"),
+            ("repeated cursor", [{"data": [], "nextCursor": "same"}, {"data": [], "nextCursor": "same"}], "repeated thread/list cursor"),
+        ]
+        for name, pages, message in cases:
+            with self.subTest(name=name):
+                server = object.__new__(adapter.AppServer)
+                calls = []
+
+                def call(_method, _params):
+                    calls.append(None)
+                    return pages[min(len(calls) - 1, len(pages) - 1)]
+
+                server.call = call
+                with self.assertRaisesRegex(adapter.AdapterError, message):
+                    server.threads()
+                self.assertLessEqual(len(calls), 2)
+
+        server = object.__new__(adapter.AppServer)
+        calls = []
+        server.call = lambda *_args: calls.append(None) or {"data": [], "nextCursor": f"cursor-{len(calls)}"}
+        with mock.patch.object(adapter, "MAX_THREAD_LIST_PAGES", 2):
+            with self.assertRaisesRegex(adapter.AdapterError, "exceeded the 2-page limit"):
+                server.threads()
+        self.assertEqual(len(calls), 2)
+
     def test_app_server_handles_extended_client_and_server_frame_lengths(self):
         sizes = (200, 66_000)
         for size in sizes:

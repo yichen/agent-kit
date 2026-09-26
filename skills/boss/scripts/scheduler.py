@@ -144,12 +144,14 @@ def live_tasks(task_ids: set[str], repo_path: Path, *, server_factory=AppServer)
                                                      or cwd_path.name.startswith("agent-kit-issue-")))
                 if task_id not in task_ids and not marker_id and not name_match and not cwd_match and not checkout_match:
                     continue
-                thread = server.read(task_id)
-                status = task_status(thread)
+                # thread/list summaries include the live state needed here. Avoid
+                # hydrating full persisted turn histories: a single old thread
+                # can exceed the bounded WebSocket frame limit.
+                status = task_status(summary)
                 result[task_id] = status
                 relevant.append({"id": task_id, "status": status, "action_id": marker_id,
                                  "issue": int(name_match.group(1)) if name_match else int(cwd_match.group(1)) if cwd_match else None,
-                                 "cwd": cwd or thread.get("cwd")})
+                                 "cwd": cwd})
             return {"by_id": result, "relevant": relevant, "all_live_threads": len(summaries)}
     except Exception as exc:
         raise SchedulerError(f"live Codex inventory unavailable: {str(exc)[:500]}") from exc

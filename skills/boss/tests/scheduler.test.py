@@ -237,18 +237,32 @@ class SchedulerTests(unittest.TestCase):
             def __exit__(self, *_args): pass
             def threads(self):
                 calls.append("thread/list")
-                return [{"id": TASK}, {"id": EXTRA_TASK, "name": "agent-kit #18: duplicate",
+                return [{"id": TASK, "status": {"type": "active"}}, {"id": EXTRA_TASK, "status": {"type": "active"}, "name": "agent-kit #18: duplicate",
                          "cwd": "/tmp/agent-kit-issue-18-deadbeef"},
                         {"id": "01a0da55-764b-7382-a952-31dd327b1452", "name": "unrelated task", "cwd": "/tmp/other"}]
             def read(self, task_id):
-                calls.append(("thread/read", task_id))
-                self.assert_task = task_id
-                return {"status": {"type": "active"}, "turns": []}
+                raise AssertionError("scheduler must not hydrate unbounded thread history")
         result = scheduler.live_tasks({TASK}, Path("/tmp/agent-kit"), server_factory=Server)
         self.assertEqual(result["by_id"], {TASK: "running", EXTRA_TASK: "running"})
         self.assertEqual(result["all_live_threads"], 3)
         self.assertEqual(len(result["relevant"]), 2)
-        self.assertEqual(calls, ["thread/list", ("thread/read", TASK), ("thread/read", EXTRA_TASK)])
+        self.assertEqual(calls, ["thread/list"])
+
+    def test_not_loaded_live_thread_is_unknown_without_reading_history(self):
+        calls = []
+        class Server:
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def threads(self):
+                calls.append("thread/list")
+                return [{"id": EXTRA_TASK, "name": "agent-kit #18: archived worker",
+                         "status": {"type": "notLoaded"}, "turns": []}]
+            def read(self, _task_id):
+                raise AssertionError("not-loaded history must not be hydrated")
+        result = scheduler.live_tasks(set(), Path("/tmp/agent-kit"), server_factory=Server)
+        self.assertEqual(result["by_id"], {EXTRA_TASK: "unknown"})
+        self.assertEqual(result["relevant"][0]["status"], "unknown")
+        self.assertEqual(calls, ["thread/list"])
 
     def test_active_duplicate_or_unmatched_agent_kit_task_is_a_dispute(self):
         cases = [
