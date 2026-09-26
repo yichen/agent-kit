@@ -50,6 +50,10 @@ APP_SERVER_SOCKET_RELATIVE_PATH = Path("app-server-control") / "app-server-contr
 WEBSOCKET_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_HTTP_HEADER_BYTES = 16 * 1024
 MAX_WEBSOCKET_MESSAGE_BYTES = 8 * 1024 * 1024
+# Keep each inventory response comfortably below the transport frame limit. A
+# hard page cap also bounds work if app-server returns a broken cursor chain.
+THREAD_LIST_PAGE_SIZE = 10
+MAX_THREAD_LIST_PAGES = 100
 
 
 def app_server_socket_path(*, environ=None, home=None) -> Path:
@@ -364,27 +368,53 @@ class AppServer:
 
     def threads(self, *, cwd=None):
         rows, cursor = [], None
-        while True:
-            params = {"limit": 100, "sortKey": "created_at", "sortDirection": "desc", "useStateDbOnly": True}
+        seen_cursors = set()
+        for _page_number in range(MAX_THREAD_LIST_PAGES):
+            params = {"limit": THREAD_LIST_PAGE_SIZE, "sortKey": "created_at", "sortDirection": "desc", "useStateDbOnly": True}
             if cursor:
                 params["cursor"] = cursor
             if cwd:
                 params["cwd"] = cwd
             result = self.call("thread/list", params)
-            rows.extend(result.get("data", []))
-            cursor = result.get("nextCursor")
-            if not cursor:
+            page = result.get("data")
+            if not isinstance(page, list) or len(page) > THREAD_LIST_PAGE_SIZE:
+                raise AdapterError("Codex app-server returned a malformed thread/list page")
+            rows.extend(page)
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None or next_cursor == "":
                 return rows
+            if not isinstance(next_cursor, str):
+                raise AdapterError("Codex app-server returned a malformed thread/list cursor")
+            if next_cursor in seen_cursors or next_cursor == cursor:
+                raise AdapterError("Codex app-server returned a repeated thread/list cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise AdapterError(f"Codex app-server thread/list exceeded the {MAX_THREAD_LIST_PAGES}-page limit")
 
     def read(self, task_id):
         return self.call("thread/read", {"threadId": task_id, "includeTurns": True}).get("thread", {})
+
+    def latest_turn_status(self, task_id):
+        """Read only the newest turn summary, never the full thread history."""
+        result = self.call("thread/turns/list", {"threadId": task_id, "limit": 1,
+                                                  "sortDirection": "desc", "itemsView": "summary"})
+        turns = result.get("data")
+        if not isinstance(turns, list) or len(turns) > 1:
+            raise AdapterError("Codex app-server returned a malformed thread/turns/list page")
+        if not turns:
+            return None
+        turn = turns[0]
+        if not isinstance(turn, dict):
+            raise AdapterError("Codex app-server returned a malformed thread turn summary")
+        status = turn.get("status")
+        return status if isinstance(status, str) else "unknown"
 
 
 def task_link(task_id):
     return f"codex://threads/{task_id}"
 
 
-def task_status(thread):
+def task_status(thread, latest_turn_status=None):
     status = thread.get("status") or {}
     kind = status.get("type") if isinstance(status, dict) else None
     flags = status.get("activeFlags", []) if isinstance(status, dict) else []
@@ -393,9 +423,15 @@ def task_status(thread):
     if kind == "active":
         return "running"
     turns = thread.get("turns") or []
-    if turns:
+    last = latest_turn_status
+    if last is None and turns:
         last = turns[-1].get("status")
+    if last is not None:
+        if last not in ("completed", "interrupted", "failed", "inProgress"):
+            return "unknown"
         return {"completed": "completed", "interrupted": "interrupted", "failed": "blocked", "inProgress": "running"}.get(last, "queued")
+    if kind == "notLoaded":
+        return "unknown"
     return "queued" if kind == "idle" else "interrupted"
 
 
