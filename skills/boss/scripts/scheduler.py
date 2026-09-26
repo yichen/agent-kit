@@ -144,10 +144,10 @@ def live_tasks(task_ids: set[str], repo_path: Path, *, server_factory=AppServer)
                                                      or cwd_path.name.startswith("agent-kit-issue-")))
                 if task_id not in task_ids and not marker_id and not name_match and not cwd_match and not checkout_match:
                     continue
-                # thread/list summaries include the live state needed here. Avoid
-                # hydrating full persisted turn histories: a single old thread
-                # can exceed the bounded WebSocket frame limit.
-                status = task_status(summary)
+                # Read only the newest turn summary. Full persisted histories can
+                # exceed the bounded WebSocket frame limit on old host threads.
+                latest_turn_status = server.latest_turn_status(task_id)
+                status = task_status(summary, latest_turn_status)
                 result[task_id] = status
                 relevant.append({"id": task_id, "status": status, "action_id": marker_id,
                                  "issue": int(name_match.group(1)) if name_match else int(cwd_match.group(1)) if cwd_match else None,

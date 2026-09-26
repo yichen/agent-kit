@@ -394,25 +394,44 @@ class AppServer:
     def read(self, task_id):
         return self.call("thread/read", {"threadId": task_id, "includeTurns": True}).get("thread", {})
 
+    def latest_turn_status(self, task_id):
+        """Read only the newest turn summary, never the full thread history."""
+        result = self.call("thread/turns/list", {"threadId": task_id, "limit": 1,
+                                                  "sortDirection": "desc", "itemsView": "summary"})
+        turns = result.get("data")
+        if not isinstance(turns, list) or len(turns) > 1:
+            raise AdapterError("Codex app-server returned a malformed thread/turns/list page")
+        if not turns:
+            return None
+        turn = turns[0]
+        if not isinstance(turn, dict):
+            raise AdapterError("Codex app-server returned a malformed thread turn summary")
+        status = turn.get("status")
+        return status if isinstance(status, str) else None
+
 
 def task_link(task_id):
     return f"codex://threads/{task_id}"
 
 
-def task_status(thread):
+def task_status(thread, latest_turn_status=None):
     status = thread.get("status") or {}
     kind = status.get("type") if isinstance(status, dict) else None
-    if kind == "notLoaded":
-        return "unknown"
     flags = status.get("activeFlags", []) if isinstance(status, dict) else []
     if "waitingOnApproval" in flags or "waitingOnUserInput" in flags:
         return "blocked"
     if kind == "active":
         return "running"
     turns = thread.get("turns") or []
-    if turns:
+    last = latest_turn_status
+    if last is None and turns:
         last = turns[-1].get("status")
+    if last is not None:
+        if last not in ("completed", "interrupted", "failed", "inProgress"):
+            return "unknown"
         return {"completed": "completed", "interrupted": "interrupted", "failed": "blocked", "inProgress": "running"}.get(last, "queued")
+    if kind == "notLoaded":
+        return "unknown"
     return "queued" if kind == "idle" else "interrupted"
 
 

@@ -411,6 +411,28 @@ class CodexWorkerAdapterTests(unittest.TestCase):
                 server.threads()
         self.assertEqual(len(calls), 2)
 
+    def test_latest_turn_status_uses_one_summary_item_and_rejects_malformed_results_table(self):
+        cases = [
+            ("latest completed", {"data": [{"id": "turn-1", "status": "completed"}]}, "completed", None),
+            ("no turns", {"data": []}, None, None),
+            ("missing data", {}, None, "malformed thread/turns/list page"),
+            ("non-list data", {"data": {}}, None, "malformed thread/turns/list page"),
+            ("server ignored limit", {"data": [{}, {}]}, None, "malformed thread/turns/list page"),
+            ("malformed turn", {"data": [None]}, None, "malformed thread turn summary"),
+        ]
+        for name, result, expected, error in cases:
+            with self.subTest(name=name):
+                server = object.__new__(adapter.AppServer)
+                calls = []
+                server.call = lambda method, params: calls.append((method, params)) or result
+                if error:
+                    with self.assertRaisesRegex(adapter.AdapterError, error):
+                        server.latest_turn_status(TASK)
+                else:
+                    self.assertEqual(server.latest_turn_status(TASK), expected)
+                self.assertEqual(calls, [("thread/turns/list", {"threadId": TASK, "limit": 1,
+                                                                 "sortDirection": "desc", "itemsView": "summary"})])
+
     def test_app_server_handles_extended_client_and_server_frame_lengths(self):
         sizes = (200, 66_000)
         for size in sizes:
