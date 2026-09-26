@@ -415,6 +415,8 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         cases = [
             ("latest completed", {"data": [{"id": "turn-1", "status": "completed"}]}, "completed", None),
             ("no turns", {"data": []}, None, None),
+            ("missing turn status", {"data": [{"id": "turn-1"}]}, "unknown", None),
+            ("non-string turn status", {"data": [{"id": "turn-1", "status": 7}]}, "unknown", None),
             ("missing data", {}, None, "malformed thread/turns/list page"),
             ("non-list data", {"data": {}}, None, "malformed thread/turns/list page"),
             ("server ignored limit", {"data": [{}, {}]}, None, "malformed thread/turns/list page"),

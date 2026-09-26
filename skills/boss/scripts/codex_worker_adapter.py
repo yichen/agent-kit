@@ -407,7 +407,7 @@ class AppServer:
         if not isinstance(turn, dict):
             raise AdapterError("Codex app-server returned a malformed thread turn summary")
         status = turn.get("status")
-        return status if isinstance(status, str) else None
+        return status if isinstance(status, str) else "unknown"
 
 
 def task_link(task_id):
