@@ -13,7 +13,7 @@
 #   ollama-delegate.sh --prompt-file <path> [options]
 #
 # Options:
-#   --model <tag>             Must equal the pinned qwen3.8:27b-mlx tag
+#   --model <tag>             Must equal the pinned qwen3.8:27b-mlx-128k tag
 #   --caller <name>           Calling skill or phase name for the event log
 #   --task-type-tag <name>    Optional bounded-work category for aggregate reporting
 #   --require-marker <text>   Required output text; may be repeated
@@ -37,8 +37,8 @@
 
 set -u
 
-MODEL="qwen3.8:27b-mlx"
-PINNED_MODEL="qwen3.8:27b-mlx"
+MODEL="qwen3.8:27b-mlx-128k"
+PINNED_MODEL="qwen3.8:27b-mlx-128k"
 CALLER="unknown"
 TASK_TYPE_TAG=""
 PROMPT_FILE=""

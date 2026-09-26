@@ -104,7 +104,7 @@ fresh_case() {
   export FAKE_CALLS="$CASE_DIR/calls"
   : > "$FAKE_CALLS"
   printf 'Turn these facts into a complete pull request body.\n' > "$CASE_DIR/prompt.txt"
-  export FAKE_PS='{"models":[{"name":"qwen3.8:27b-mlx","context_length":65536}]}'
+  export FAKE_PS='{"models":[{"name":"qwen3.8:27b-mlx-128k","context_length":65536}]}'
   export FAKE_RESPONSE='{"response":"## Summary\n- Add local composition with safe fallback and deterministic validation.\n\n## Test plan\n- [x] Run the delegate helper tests and selector tests successfully.\n","prompt_eval_count":27,"eval_count":38,"done":true,"done_reason":"stop"}'
   unset FAKE_PS_HTTP FAKE_PS_STATUS FAKE_HTTP FAKE_CURL_STATUS CAPTURE_REQUEST OLLAMA_DELEGATE_DISABLE FAKE_POST_READY FAKE_POST_RELEASE
   unset FAKE_CLEANUP_OWNER_PID FAKE_CLEANUP_REMOVE_READY FAKE_CLEANUP_REMOVE_RELEASE
@@ -174,7 +174,7 @@ export CAPTURE_REQUEST="$CASE_DIR/warm-request.json"
 run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --warm --caller maintenance/warm
 assert_eq "warm mode exits 0" 0 "$RUN_STATUS"
 assert_eq "warm mode posts without a loaded-model preflight" POST "$(tr -d '\n' < "$FAKE_CALLS")"
-node -e 'const r=require(process.argv[1]); if(r.model!=="qwen3.8:27b-mlx"||r.prompt!==""||r.keep_alive!=="8h"||r.stream!==false||r.think!==false)process.exit(1)' "$CAPTURE_REQUEST"
+node -e 'const r=require(process.argv[1]); if(r.model!=="qwen3.8:27b-mlx-128k"||r.prompt!==""||r.keep_alive!=="8h"||r.stream!==false||r.think!==false)process.exit(1)' "$CAPTURE_REQUEST"
 pass "warm mode pins the model and eight-hour residency"
 assert_contains "warm mode is maintenance telemetry" "$OLLAMA_DELEGATE_LOG_FILE" '"event_type":"maintenance"'
 
@@ -184,7 +184,7 @@ assert_eq "warm mode rejects generation arguments" 1 "$RUN_STATUS"
 assert_eq "invalid warm request performs no network call" 0 "$(wc -l < "$FAKE_CALLS" | tr -d ' ')"
 
 fresh_case
-export FAKE_PS='{"models":[{"name":"qwen3.8:27b-mlx","context_length":1}]}'
+export FAKE_PS='{"models":[{"name":"qwen3.8:27b-mlx-128k","context_length":1}]}'
 run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt"
 assert_eq "oversized prompt exits 2" 2 "$RUN_STATUS"
 assert_eq "oversized prompt is never posted" GET "$(tr -d '\n' < "$FAKE_CALLS")"
@@ -193,7 +193,7 @@ assert_contains "oversized prompt has its own outcome" "$OLLAMA_DELEGATE_LOG_FIL
 while IFS='|' read -r label prompt_text; do
   fresh_case
   printf '%s\n' "$prompt_text" > "$CASE_DIR/prompt.txt"
-  export FAKE_PS='{"models":[{"name":"qwen3.8:27b-mlx","context_length":40}]}'
+  export FAKE_PS='{"models":[{"name":"qwen3.8:27b-mlx-128k","context_length":40}]}'
   run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt"
   assert_eq "$label exits 2 under byte-safe prompt bound" 2 "$RUN_STATUS"
   assert_eq "$label is rejected before POST" GET "$(tr -d '\n' < "$FAKE_CALLS")"
@@ -210,7 +210,7 @@ assert_eq "valid response exits 0" 0 "$RUN_STATUS"
 assert_contains "valid response reaches stdout" "$CASE_DIR/out" '## Summary'
 assert_eq "success releases the lock" absent "$([ -e "$OLLAMA_DELEGATE_LOCK_DIR" ] && echo present || echo absent)"
 assert_contains "success logs Ollama prompt tokens" "$OLLAMA_DELEGATE_LOG_FILE" '"prompt_tokens":27'
-node -e 'const r=require(process.argv[1]); if(r.model!=="qwen3.8:27b-mlx"||r.stream!==false||r.think!==false)process.exit(1)' "$CAPTURE_REQUEST"
+node -e 'const r=require(process.argv[1]); if(r.model!=="qwen3.8:27b-mlx-128k"||r.stream!==false||r.think!==false)process.exit(1)' "$CAPTURE_REQUEST"
 pass "request pins the model and disables thinking and streaming"
 RECEIPT_ID="$(tr -d '\r\n' < "$CASE_DIR/receipt")"
 assert_eq "success returns a receipt ID" 32 "${#RECEIPT_ID}"

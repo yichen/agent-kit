@@ -24,7 +24,7 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   */api/ps)
-    printf '%s' '{"models":[{"name":"qwen3.8:27b-mlx","context_length":65536}]}' > "$output"
+    printf '%s' '{"models":[{"name":"qwen3.8:27b-mlx-128k","context_length":65536}]}' > "$output"
     ;;
   */api/generate)
     cp "$data_file" "${CAPTURE_REQUEST:?}"
