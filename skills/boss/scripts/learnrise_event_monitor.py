@@ -195,12 +195,16 @@ def semantic(ledger, outbox, supervisor, inventory, now):
     for row in ledger["objectives"]:
         prs = row.get("pull_requests") or []
         states = row.get("pull_request_states") or {}
-        state = "COMPLETED" if row.get("status") == "COMPLETED" else row.get("github_state") or row.get("status")
-        result[f"objective:{row['id']}"] = {"state": state, "prs": [[n, states.get(str(n)), (row.get("pr_observations") or {}).get(str(n), {}).get("head")] for n in prs], "gate": bool(row.get("human_gate")) if state == "OPEN" else False, "activity": row.get("last_activity_utc") if row.get("human_gate") and state == "OPEN" else None}
+        gate = row.get("github_state") == "OPEN" and bool(row.get("human_gate"))
+        state = ("OPEN" if gate else "COMPLETED" if row.get("status") == "COMPLETED"
+                 else row.get("github_state") or row.get("status"))
+        result[f"objective:{row['id']}"] = {"state": state, "prs": [[n, states.get(str(n)), (row.get("pr_observations") or {}).get(str(n), {}).get("head")] for n in prs], "gate": gate, "activity": row.get("last_activity_utc") if gate else None}
     for pr in ledger["open_pull_requests"]:
         obs = pr.get("observation") or {}
         checks = obs.get("checks") or []
-        result[f"pr:{pr['number']}"] = {"head": pr["head"], "objective": pr.get("objective"), "merge": pr.get("merge"), "review": (obs.get("review") or {}).get("state"), "failed_check_count": sum(c.get("state") == "FAILURE" for c in checks)}
+        failed_checks = sorted(c["name"] for c in checks if c.get("state") == "FAILURE")
+        failed_digest = hashlib.sha256(json.dumps(failed_checks, separators=(",", ":")).encode()).hexdigest()
+        result[f"pr:{pr['number']}"] = {"head": pr["head"], "objective": pr.get("objective"), "merge": pr.get("merge"), "review": (obs.get("review") or {}).get("state"), "failed_check_count": len(failed_checks), "failed_checks_sha256": failed_digest}
     for task in inventory["tasks"]:
         result[f"task:{task['id']}"] = {"status": task["status"]}
     for aid, rec in outbox["actions"].items():
@@ -267,13 +271,17 @@ def validate_semantic_state(entity, state):
                 raise MonitorError("invalid objective PR cursor state")
             numbers.add(pr[0])
     elif kind == "pr":
-        if (keys != {"head", "objective", "merge", "review", "failed_check_count"} or
+        if (keys not in ({"head", "objective", "merge", "review", "failed_check_count"},
+                         {"head", "objective", "merge", "review", "failed_check_count", "failed_checks_sha256"}) or
                 not isinstance(state["head"], str) or not SHA.fullmatch(state["head"]) or
                 (state["objective"] is not None and (not isinstance(state["objective"], str) or not LABEL.fullmatch(state["objective"]))) or
                 not enum(state["merge"], {"CLEAN", "DIRTY", "UNKNOWN"}) or
                 not enum(state["review"], {"APPROVED", "CHANGES_REQUESTED", "STALE", "MISSING"}) or
                 type(state["failed_check_count"]) is not int or state["failed_check_count"] < 0):
             raise MonitorError("invalid PR cursor state")
+        if "failed_checks_sha256" in state and (type(state["failed_checks_sha256"]) is not str or
+                not re.fullmatch(r"[0-9a-f]{64}", state["failed_checks_sha256"])):
+            raise MonitorError("invalid failed check digest")
     elif kind == "task":
         if keys != {"status"} or not enum(state["status"], {"queued", "running", "completed", "interrupted", "blocked"}):
             raise MonitorError("invalid task cursor state")

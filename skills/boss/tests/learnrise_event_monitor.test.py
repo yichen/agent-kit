@@ -217,22 +217,118 @@ class MonitorTests(unittest.TestCase):
         self.assertNotEqual(monitor.event_id("dependency:gate:device-acceptance", before, after, 1),
                             monitor.event_id("dependency:gate:device-acceptance", after, before, 2))
 
-    def test_completed_ledger_status_wins_over_open_github_issue(self):
+    def test_completed_status_preserves_open_human_gate_table(self):
         now = monitor.now_utc()
-        cases = [("OPEN", "COMPLETED", "COMPLETED", False),
-                 ("CLOSED", "COMPLETED", "COMPLETED", False),
-                 ("OPEN", "IN_PROGRESS", "OPEN", True),
-                 ("CLOSED", "IN_PROGRESS", "CLOSED", False)]
-        for github_state, status, expected_state, expected_gate in cases:
-            with self.subTest(github_state=github_state, status=status):
+        cases = [("OPEN", "COMPLETED", True, "OPEN", True),
+                 ("OPEN", "COMPLETED", False, "COMPLETED", False),
+                 ("CLOSED", "COMPLETED", True, "COMPLETED", False),
+                 ("OPEN", "IN_PROGRESS", True, "OPEN", True),
+                 ("OPEN", "IN_PROGRESS", False, "OPEN", False),
+                 ("CLOSED", "IN_PROGRESS", True, "CLOSED", False)]
+        for github_state, status, human_gate, expected_state, expected_gate in cases:
+            with self.subTest(github_state=github_state, status=status, human_gate=human_gate):
                 ledger = {"dependency_gates": [], "open_pull_requests": [],
                           "objectives": [{"id": "#1", "github_state": github_state,
-                                          "status": status, "human_gate": True,
+                                          "status": status, "human_gate": human_gate,
+                                          "last_activity_utc": now.isoformat(),
                                           "pull_requests": [], "pull_request_states": {}}]}
                 state = monitor.semantic(ledger, {"actions": {}}, {"actions": {}},
                                          {"tasks": []}, now)["objective:#1"]
                 self.assertEqual(state["state"], expected_state)
                 self.assertIs(state["gate"], expected_gate)
+                self.assertEqual(state["activity"], now.isoformat() if expected_gate else None)
+                baseline = monitor.baseline_current({"objective:#1": state}, Path("/tmp"))
+                self.assertEqual("objective:#1" in baseline["ids"], expected_gate)
+
+    def test_merged_pr_completion_keeps_open_issue_gate_activity_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            now = monitor.now_utc()
+            report = self.fixture(path, now)
+            observed_path = path / "boss-observed-ledger.json"
+            observed = monitor.read_json(observed_path)
+            row = observed["objectives"][0]
+            row.update(status="COMPLETED", pull_requests=[2], pull_request_states={"2": "MERGED"})
+            observed["open_pull_requests"] = []
+            monitor.atomic(observed_path, observed)
+            self.refresh_shadow_fixture(path, now, report)
+            args = ["--apply", "--state-dir", str(path), "--observed", str(observed_path),
+                    "--outbox", str(path / "boss-action-outbox.json"),
+                    "--supervisor", str(path / "pr-supervisor-state.json")]
+            queued = []
+            def runner(argv, timeout=120):
+                if "queue" in argv:
+                    queued.append(json.loads(argv[-1]))
+                    return Result()
+                return Result(3, json.dumps(report))
+            with patch.object(monitor, "bounded_run", side_effect=runner):
+                self.assertEqual(monitor.main(args), 0)
+                self.assertIn("objective:#1", queued[0]["current"]["ids"])
+                row["last_activity_utc"] = (now + timedelta(minutes=1)).isoformat()
+                monitor.atomic(observed_path, observed)
+                self.assertEqual(monitor.main(args), 0)
+                self.assertEqual([event["entity"] for event in queued], ["baseline", "objective:#1"])
+                self.assertEqual(queued[1]["current"]["state"], "OPEN")
+                self.assertEqual(monitor.main(args), 0)
+                self.assertEqual(len(queued), 2)
+
+    def test_failed_check_identity_changes_wake_once_reorder_is_quiet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            now = monitor.now_utc()
+            report = self.fixture(path, now)
+            observed_path = path / "boss-observed-ledger.json"
+            observed = monitor.read_json(observed_path)
+            checks = observed["open_pull_requests"][0]["observation"]["checks"]
+            checks[:] = [{"name": "check-A", "state": "FAILURE"},
+                         {"name": "check-B", "state": "FAILURE"}]
+            monitor.atomic(observed_path, observed)
+            self.refresh_shadow_fixture(path, now, report)
+            args = ["--apply", "--state-dir", str(path), "--observed", str(observed_path),
+                    "--outbox", str(path / "boss-action-outbox.json"),
+                    "--supervisor", str(path / "pr-supervisor-state.json")]
+            queued = []
+            def runner(argv, timeout=120):
+                if "queue" in argv:
+                    queued.append(json.loads(argv[-1]))
+                    return Result()
+                return Result(3, json.dumps(report))
+            with patch.object(monitor, "bounded_run", side_effect=runner):
+                self.assertEqual(monitor.main(args), 0)
+                checks.reverse()
+                monitor.atomic(observed_path, observed)
+                self.assertEqual(monitor.main(args), 0)
+                self.assertEqual(len(queued), 1)
+                checks[0]["name"] = "check-C"
+                monitor.atomic(observed_path, observed)
+                self.assertEqual(monitor.main(args), 0)
+                self.assertEqual([event["entity"] for event in queued], ["baseline", "pr:2"])
+                self.assertNotEqual(queued[1]["previous"]["failed_checks_sha256"],
+                                    queued[1]["current"]["failed_checks_sha256"])
+                self.assertEqual(queued[1]["current"]["failed_check_count"], 2)
+                self.assertEqual(monitor.main(args), 0)
+                self.assertEqual(len(queued), 2)
+
+    def test_failed_check_cursor_schema_table(self):
+        base = {"head": "a" * 40, "objective": "#1", "merge": "CLEAN",
+                "review": "APPROVED", "failed_check_count": 2,
+                "failed_checks_sha256": "a" * 64}
+        cases = [
+            ("current", base, True),
+            ("legacy_retry", {key: value for key, value in base.items() if key != "failed_checks_sha256"}, True),
+            ("non_string", {**base, "failed_checks_sha256": 7}, False),
+            ("wrong_length", {**base, "failed_checks_sha256": "a" * 63}, False),
+            ("uppercase", {**base, "failed_checks_sha256": "A" * 64}, False),
+            ("injection", {**base, "failed_checks_sha256": "a" * 63 + "\n"}, False),
+            ("extra_field", {**base, "failed_checks": ["check-A", "check-B"]}, False),
+        ]
+        for name, state, valid in cases:
+            with self.subTest(name=name):
+                if valid:
+                    monitor.validate_semantic_state("pr:2", state)
+                else:
+                    with self.assertRaises(monitor.MonitorError):
+                        monitor.validate_semantic_state("pr:2", state)
 
     def test_live_scan_transitions_deliver_owner_task_issue_and_gate_events(self):
         task_id = "01a0d565-c171-7120-b828-b04db384021f"
