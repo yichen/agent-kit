@@ -226,3 +226,33 @@ Dependency readiness is reported separately from low-risk suitability; it
 never approves a pilot. A human must explicitly select and accept the pilot.
 Issue #20 stays unlaunched; this scheduler neither implements nor claims a
 global Pi slot across hosts.
+
+### LearnRise event monitor
+
+`scripts/learnrise_event_monitor.py` replaces repeated model heartbeats for
+covered LearnRise objectives. Its default invocation and `--status` read only
+the persisted cursor, receipt, and fault. `--shadow` runs the existing live
+bridge without `--hub-task`, refreshes producer snapshots and a success receipt,
+and prints a local change preview without queueing or advancing delivery.
+`--apply` runs the same bridge, compares semantic objective, PR, task, boss
+action, OPEN/ACKED supervisor state, and dependency gate satisfaction, then
+queues bounded event IDs to the
+verified existing hub. The cursor retains generations and pending deliveries;
+an ambiguous queue result is retried with the same ID. The first `--apply`
+queues one `reconcile_only` baseline of unresolved actions and open human gates.
+Do not run it until covered heartbeats are paused and prior hub turns are
+drained. The hub must deduplicate event IDs and recheck all live gates before
+any action. An event never grants dispatch, acceptance, or merge authority.
+
+After installing the merged skill, run
+`scripts/install-learnrise-monitor.sh install` for a 900-second shadow job and
+an independent 60-second watchdog. Inspect `--status`, the local snapshot,
+shadow stdout, source freshness, and all open PR and objective counts. Complete
+the coverage, queue canary, and stopped-monitor watchdog canary before pausing
+covered heartbeats. Then run `scripts/install-learnrise-monitor.sh activate`
+and the first `--apply`, verify the baseline receipt, and observe an unchanged
+cycle. `scripts/install-learnrise-monitor.sh check` validates the two jobs.
+On cutover failure, restore the paused heartbeats and run
+`scripts/install-learnrise-monitor.sh stop`; it unloads only these new jobs.
+The watchdog retries one stable fault event per outage and also leaves a local
+alert when its queue call fails.
