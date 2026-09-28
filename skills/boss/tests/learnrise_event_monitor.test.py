@@ -505,6 +505,22 @@ class MonitorTests(unittest.TestCase):
                                  sorted(["boss:" + "a" * 24, "supervisor:" + "b" * 20, "objective:#1"]))
                 self.assertEqual(cursor_path.read_bytes(), original)
 
+    def test_shadow_uses_post_bridge_clock_for_fresh_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            finished = monitor.now_utc()
+            started = finished - timedelta(minutes=3)
+            report = self.fixture(path, finished)
+            with patch.object(monitor, "now_utc", side_effect=[started, finished]), \
+                 patch.object(monitor, "bounded_run", return_value=Result(3, json.dumps(report))), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(monitor.main(["--shadow", "--state-dir", str(path),
+                                               "--observed", str(path / "boss-observed-ledger.json"),
+                                               "--outbox", str(path / "boss-action-outbox.json"),
+                                               "--supervisor", str(path / "pr-supervisor-state.json")]), 0)
+            receipt = monitor.read_json(path / "learnrise-monitor-receipt.json")
+            self.assertEqual(receipt["as_of"], finished.isoformat())
+
     def test_shadow_baseline_preview_is_bounded_before_receipt_write(self):
         cases = [("at_bound", 97, 0), ("over_bound", 98, 2)]
         for name, gate_count, expected in cases:
