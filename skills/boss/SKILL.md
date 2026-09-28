@@ -233,7 +233,10 @@ global Pi slot across hosts.
 covered LearnRise objectives. Its default invocation and `--status` read only
 the persisted cursor, receipt, and fault. `--shadow` runs the existing live
 bridge without `--hub-task`, refreshes producer snapshots and a success receipt,
-and prints a local change preview without queueing or advancing delivery.
+and prints a local change preview plus the exact bounded baseline IDs, counts,
+stable baseline snapshot path, and baseline event ID without queueing or
+advancing delivery. The first apply writes that baseline snapshot once, before
+queueing, and later shadow scans cannot overwrite it.
 `--apply` runs the same bridge, compares semantic objective, PR, task, boss
 action, OPEN/ACKED supervisor state, and dependency gate satisfaction, then
 queues bounded event IDs to the
@@ -247,15 +250,80 @@ any action. An event never grants dispatch, acceptance, or merge authority.
 After installing the merged skill, run
 `scripts/install-learnrise-monitor.sh install` for a 900-second shadow job and
 an independent 60-second watchdog. Inspect `--status`, the local snapshot,
-shadow stdout, source freshness, and all open PR and objective counts. Complete
-the coverage, queue canary, and stopped-monitor watchdog canary before pausing
-covered heartbeats. Then run `scripts/install-learnrise-monitor.sh activate`
-and the first `--apply`, verify the baseline receipt, and observe an unchanged
+shadow stdout, source freshness, and all open PR and objective counts. Review
+the shadow baseline IDs and counts against owners and gates. Complete the
+coverage, queue canary, preview canary, and stopped-monitor watchdog canary
+before pausing only the covered heartbeats. Drain prior hub turns after the
+pause. Record this evidence in
+`$HOME/agents-artifacts/learnrise-orchestrator/learnrise-monitor-cutover-ready.json`:
+
+```json
+{"version":1,"as_of":"<UTC timestamp>","hub":"<verified hub UUID>","coverage":{"covered_heartbeat_ids":["<UUID>"],"paused_heartbeat_ids":["<same UUID>"],"objectives":["<covered objective ID>"],"complete":true,"paused_at":"<UTC timestamp>"},"drain":{"confirmed_at":"<UTC timestamp>","method":"observed_empty","no_prior_turns":true},"shadow":{"receipt_as_of":"<exact shadow receipt as_of>","baseline_id":"<shadow baseline_event_id>","reviewed":true},"canaries":{"queue":true,"watchdog":true,"preview":true}}
+```
+
+Use `method: interval_elapsed` only after waiting one full 15-minute former
+heartbeat interval and inspecting the hub turns. The readiness record must be
+fresh (within 35 minutes), name the exact paused heartbeat set, match the
+latest shadow receipt and snapshot, and carry the reviewed baseline ID. Check
+it read-only with:
+
+```sh
+python3 "$HOME/.agents/skills/boss/scripts/learnrise_event_monitor.py" \
+  --cutover-check --state-dir "$HOME/agents-artifacts/learnrise-orchestrator" \
+  --hub '<verified-hub-uuid>'
+```
+
+`activate` runs the same check before changing jobs and again after unloading
+shadow. It leaves the apply job's `RunAtLoad` off. The first installed
+`--apply` checks the activation mode, readiness evidence, and the complete
+semantic shadow snapshot before seeding the cursor or queueing the reviewed
+baseline. Any PR head, action status, task state, or other semantic change
+requires a fresh shadow scan and renewed readiness record. Run apply manually
+after activation, verify the baseline receipt,
+and observe an unchanged
 cycle. `scripts/install-learnrise-monitor.sh check` validates the two jobs.
+The readiness file is an operator attestation: validation checks its shape,
+freshness, hub, matching paused-ID set, sequence, canaries, and reviewed
+shadow baseline, but cannot independently read live automation pause states or
+prove that the hub queue was drained. Verify those live facts with the Codex
+automation and task tools before writing the file.
 The installer records `learnrise-monitor-mode` under the host artifact root;
 `check` verifies it against the loaded plist, and the watchdog treats a fresh
 shadow receipt after activation as a fault until an apply run succeeds.
 On cutover failure, restore the paused heartbeats and run
 `scripts/install-learnrise-monitor.sh stop`; it unloads only these new jobs.
+Any first-apply failure before baseline delivery, including bridge or semantic
+drift failure before a cursor exists, writes
+`learnrise-monitor-rearm-required.json` and blocks every scheduled apply retry.
+The first apply also writes `learnrise-monitor-cutover-attempt.json` under the
+monitor lock before calling the bridge. An interrupted process leaves that
+record behind; scheduled apply stays disarmed even if the original readiness
+is still fresh. The watchdog allows five minutes for a live locked attempt
+and reports an abandoned attempt once its lock is gone or the grace expires.
+If a baseline was already pending, the cursor retains its original event ID.
+If baseline delivery committed but the process stopped before removing the
+attempt or rearm record, the next apply clears those records under the lock
+and continues from the committed cursor without sending the baseline again.
+The activation readiness check accepts this committed cursor after a fresh
+shadow review, so stop, shadow reinstall, and activate remain usable.
+The watchdog keeps this cutover fault visible. `stop` preserves the cursor and
+rearm marker for a safe rollback. To retry, install shadow again, inspect a
+fresh shadow scan and current owners, pause the covered heartbeats, drain the
+hub, and write a new readiness file with the fresh shadow baseline review.
+Add `"rearm":{"pending_event_ids":["<IDs in stored cursor order>"],"reviewed":true}`
+after reviewing the stored pending baseline and transitions. The fresh shadow
+baseline can differ from the pending baseline; the latter retains its original
+ID and original immutable snapshot. If no cursor was created, use an empty
+`pending_event_ids` list. Run `activate`, then manually run:
+
+```sh
+python3 "$HOME/.agents/skills/boss/scripts/learnrise_event_monitor.py" \
+  --apply --rearm --state-dir "$HOME/agents-artifacts/learnrise-orchestrator" \
+  --hub '<verified-hub-uuid>'
+```
+
+This single explicit run checks
+the renewed evidence and retries the pending IDs. Another failure creates a
+new rearm requirement; never delete the marker to force a retry.
 The watchdog retries one stable fault event per outage and also leaves a local
 alert when its queue call fails.

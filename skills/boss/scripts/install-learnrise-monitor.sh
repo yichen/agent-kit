@@ -57,6 +57,11 @@ if [ "$MODE" = check ]; then
   /usr/bin/grep -Fq "<string>$SKILL_PATH/scripts/learnrise_event_watchdog.py</string>" "$WATCH_PLIST" || { echo "watchdog executable mismatch" >&2; exit 2; }
   /usr/bin/grep -Eq '<string>--(shadow|apply)</string>' "$PLIST" && /usr/bin/grep -Fq "<string>--$EXPECTED_MODE</string>" "$PLIST" || { echo "monitor activation mode mismatch" >&2; exit 2; }
   /usr/bin/grep -Fq '<integer>900</integer>' "$PLIST" && /usr/bin/grep -Fq '<integer>60</integer>' "$WATCH_PLIST" || { echo "monitor interval mismatch" >&2; exit 2; }
+  if [ "$EXPECTED_MODE" = shadow ]; then
+    /usr/bin/grep -Fq '<key>RunAtLoad</key><true/>' "$PLIST" || { echo "shadow startup mismatch" >&2; exit 2; }
+  else
+    /usr/bin/grep -Fq '<key>RunAtLoad</key><false/>' "$PLIST" || { echo "apply startup mismatch" >&2; exit 2; }
+  fi
   echo "LearnRise monitor and watchdog loaded"
   exit 0
 fi
@@ -65,12 +70,14 @@ if [ "$MODE" = activate ]; then
   [ -f "$PLIST" ] && [ -f "$WATCH_PLIST" ] || { echo "install shadow first" >&2; exit 2; }
   bash "$0" check >/dev/null
   /usr/bin/grep -Fq '<string>--shadow</string>' "$PLIST" || { echo "monitor is not in shadow mode" >&2; exit 2; }
+  /usr/bin/python3 "$SKILL_PATH/scripts/learnrise_event_monitor.py" --cutover-check --state-dir "$STATE_DIR" --hub "$HUB" >/dev/null || { echo "cutover readiness check failed" >&2; exit 2; }
   CANDIDATE="$(mktemp "$AGENTS_DIR/.learnrise-monitor-activate.XXXXXX")"
   BACKUP="$(mktemp "$AGENTS_DIR/.learnrise-monitor-backup.XXXXXX")"
   MODE_CANDIDATE="$(mktemp "$STATE_DIR/.learnrise-mode.XXXXXX")"
   printf 'apply\n' > "$MODE_CANDIDATE"
   cp "$PLIST" "$BACKUP"
-  sed 's/<string>--shadow<\/string>/<string>--apply<\/string>/' "$PLIST" > "$CANDIDATE"
+  sed -e 's/<string>--shadow<\/string>/<string>--apply<\/string>/' \
+      -e 's/<key>RunAtLoad<\/key><true\/>/<key>RunAtLoad<\/key><false\/>/' "$PLIST" > "$CANDIDATE"
   if ! plutil -lint "$CANDIDATE"; then
     rm -f "$CANDIDATE" "$BACKUP" "$MODE_CANDIDATE"
     exit 2
@@ -81,7 +88,9 @@ if [ "$MODE" = activate ]; then
     launchctl bootstrap "gui/$UID_NUM" "$PLIST" || true
     rm -f "$CANDIDATE" "$BACKUP" "$MODE_CANDIDATE"
   }
-  if ! bootout "$LABEL" || ! cp "$CANDIDATE" "$PLIST" || ! launchctl bootstrap "gui/$UID_NUM" "$PLIST" || ! mv "$MODE_CANDIDATE" "$MODE_FILE"; then
+  if ! bootout "$LABEL" || \
+     ! /usr/bin/python3 "$SKILL_PATH/scripts/learnrise_event_monitor.py" --cutover-check --state-dir "$STATE_DIR" --hub "$HUB" >/dev/null || \
+     ! cp "$CANDIDATE" "$PLIST" || ! launchctl bootstrap "gui/$UID_NUM" "$PLIST" || ! mv "$MODE_CANDIDATE" "$MODE_FILE"; then
     rollback_activate
     echo "activation failed; shadow monitor restored" >&2
     exit 2

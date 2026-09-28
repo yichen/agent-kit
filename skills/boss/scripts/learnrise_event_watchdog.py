@@ -11,7 +11,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
-from learnrise_event_monitor import ARTIFACTS, MonitorError, UUID, atomic, instant, read_json
+from learnrise_event_monitor import ARTIFACTS, MonitorError, UUID, atomic, attempt_as_rearm_marker, instant, read_json
 
 UTC = timezone.utc
 
@@ -69,11 +69,40 @@ def check(state_dir, hub, max_age=35, now=None, queue=None, notify=None):
                 reason = "monitor receipt malformed"
         if monitor_fault or fault_invalid:
             reason = "monitor scan fault"
+        if (state_dir / "learnrise-monitor-rearm-required.json").exists():
+            reason = "monitor cutover rearm required"
+        active_attempt = False
+        attempt_path = state_dir / "learnrise-monitor-cutover-attempt.json"
+        if attempt_path.exists():
+            try:
+                attempt = read_json(attempt_path)
+                attempt_as_rearm_marker(attempt)
+                age = now - instant(attempt["started_at"], "cutover attempt")
+                active = False
+                lock_path = state_dir / "learnrise-monitor.lock"
+                with lock_path.open("r") as monitor_lock:
+                    try:
+                        fcntl.flock(monitor_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        active = True
+                    else:
+                        fcntl.flock(monitor_lock, fcntl.LOCK_UN)
+                if (active and timedelta(0) <= age <= timedelta(minutes=5) and
+                        reason in (None, "monitor receipt absent", "monitor receipt stale")):
+                    # Apply has not emitted its first receipt yet. The held
+                    # monitor lock proves this is still the same live scan.
+                    reason = None
+                    mode_error = None
+                    active_attempt = True
+                elif not (state_dir / "learnrise-monitor-rearm-required.json").exists():
+                    reason = "monitor cutover attempt abandoned"
+            except (MonitorError, OSError, ValueError, TypeError, KeyError, RecursionError):
+                reason = "monitor cutover attempt malformed"
         if alert_invalid:
             reason = "watchdog alert state malformed"
         if reason is None and mode_error:
             reason = mode_error
-        if reason is None and receipt is not None and receipt.get("mode") != expected_mode:
+        if reason is None and receipt is not None and receipt.get("mode") != expected_mode and not active_attempt:
             reason = "monitor receipt mode mismatch"
         if reason is None:
             if alert_path.exists():

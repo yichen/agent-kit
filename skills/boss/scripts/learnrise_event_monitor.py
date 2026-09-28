@@ -195,7 +195,7 @@ def semantic(ledger, outbox, supervisor, inventory, now):
     for row in ledger["objectives"]:
         prs = row.get("pull_requests") or []
         states = row.get("pull_request_states") or {}
-        state = row.get("github_state") or row.get("status")
+        state = "COMPLETED" if row.get("status") == "COMPLETED" else row.get("github_state") or row.get("status")
         result[f"objective:{row['id']}"] = {"state": state, "prs": [[n, states.get(str(n)), (row.get("pr_observations") or {}).get(str(n), {}).get("head")] for n in prs], "gate": bool(row.get("human_gate")) if state == "OPEN" else False, "activity": row.get("last_activity_utc") if row.get("human_gate") and state == "OPEN" else None}
     for pr in ledger["open_pull_requests"]:
         obs = pr.get("observation") or {}
@@ -299,7 +299,7 @@ def validate_semantic_state(entity, state):
 
 
 def validate_baseline(current, state_dir):
-    if not isinstance(current, dict) or set(current) != {"counts", "ids", "snapshot", "reconcile_only"}:
+    if not isinstance(current, dict) or set(current) != {"counts", "ids", "snapshot", "snapshot_digest", "reconcile_only"}:
         raise MonitorError("invalid baseline cursor event")
     counts = current["counts"]
     kinds = {"boss", "supervisor", "human_gates", "dependency_gates"}
@@ -307,7 +307,9 @@ def validate_baseline(current, state_dir):
             any(type(value) is not int or value < 0 for value in counts.values()) or
             not isinstance(current["ids"], list) or len(current["ids"]) > 100 or
             any(type(entity) is not str for entity in current["ids"]) or
-            current["snapshot"] != str(state_dir / "learnrise-monitor-snapshot.json") or
+            type(current["snapshot_digest"]) is not str or
+            not re.fullmatch(r"[0-9a-f]{64}", current["snapshot_digest"]) or
+            current["snapshot"] != str(state_dir / f"learnrise-monitor-baseline-{current['snapshot_digest']}.json") or
             current["reconcile_only"] is not True):
         raise MonitorError("invalid baseline cursor event")
     ids = current["ids"]
@@ -386,6 +388,9 @@ def validate_cursor(cursor, state_dir):
 
 
 def event_id(entity, before, after, generation):
+    if entity == "baseline" and isinstance(after, dict):
+        after = {"counts": after.get("counts"), "ids": after.get("ids"),
+                 "reconcile_only": after.get("reconcile_only")}
     identity = [REPO, entity, before, after, generation, (after or {}).get("head")]
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:32]
 
@@ -411,6 +416,153 @@ def preview_changes(entities, observed):
                for entity in entities.keys() | observed.keys())
 
 
+def baseline_current(snapshot, state_dir):
+    unresolved = sorted(k for k in snapshot if k.startswith(("boss:", "supervisor:")) or
+                        (k.startswith("objective:") and snapshot[k].get("gate")) or
+                        (k.startswith("dependency:") and not snapshot[k]["satisfied"]))
+    if len(unresolved) > 100:
+        raise MonitorError("baseline contains too many unresolved IDs for one bounded message")
+    digest = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    current = {"counts": {"boss": sum(k.startswith("boss:") for k in unresolved),
+                       "supervisor": sum(k.startswith("supervisor:") for k in unresolved),
+                       "human_gates": sum(k.startswith("objective:") for k in unresolved),
+                       "dependency_gates": sum(k.startswith("dependency:") for k in unresolved)},
+            "ids": unresolved,
+            "snapshot": str(state_dir / f"learnrise-monitor-baseline-{digest}.json"),
+            "snapshot_digest": digest,
+            "reconcile_only": True}
+    # The queue limit applies to the complete encoded event, including the
+    # path and instruction, rather than merely to the unresolved-ID count.
+    message({"id": event_id("baseline", None, current, 1), "entity": "baseline",
+             "previous": None, "current": current})
+    return current
+
+
+def verify_baseline_snapshot(current):
+    content = read_json(Path(current["snapshot"]))
+    if (set(content) != {"repository", "entities", "semantic_sha256"} or
+            content["repository"] != REPO or content["semantic_sha256"] != current["snapshot_digest"] or
+            not isinstance(content["entities"], dict) or
+            hashlib.sha256(json.dumps(content["entities"], sort_keys=True, separators=(",", ":")).encode()).hexdigest() != current["snapshot_digest"] or
+            baseline_current(content["entities"], Path(current["snapshot"]).parent) != current):
+        raise MonitorError("baseline snapshot content mismatch")
+    return content["entities"]
+
+
+def write_baseline_snapshot(snapshot, current):
+    path = Path(current["snapshot"])
+    content = {"repository": REPO, "entities": snapshot,
+               "semantic_sha256": current["snapshot_digest"]}
+    if baseline_current(snapshot, path.parent) != current:
+        raise MonitorError("baseline snapshot key mismatch")
+    fd, temporary = tempfile.mkstemp(prefix=".baseline-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(content, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+    finally:
+        os.unlink(temporary)
+    if verify_baseline_snapshot(current) != snapshot:
+        raise MonitorError("baseline snapshot collision")
+
+
+def validate_cutover_ready(state_dir, hub, now):
+    ready = read_json(state_dir / "learnrise-monitor-cutover-ready.json")
+    receipt = read_json(state_dir / "learnrise-monitor-receipt.json")
+    snapshot = read_json(state_dir / "learnrise-monitor-snapshot.json")
+    if (set(ready) not in ({"version", "as_of", "hub", "coverage", "drain", "shadow", "canaries"},
+                           {"version", "as_of", "hub", "coverage", "drain", "shadow", "canaries", "rearm"}) or
+            type(ready["version"]) is not int or ready["version"] != 1 or ready["hub"] != hub or
+            not isinstance(ready["coverage"], dict) or
+            set(ready["coverage"]) != {"covered_heartbeat_ids", "paused_heartbeat_ids", "objectives", "complete", "paused_at"} or
+            not isinstance(ready["drain"], dict) or
+            set(ready["drain"]) != {"confirmed_at", "method", "no_prior_turns"} or
+            not isinstance(ready["shadow"], dict) or
+            set(ready["shadow"]) != {"receipt_as_of", "baseline_id", "reviewed"} or
+            not isinstance(ready["canaries"], dict) or
+            set(ready["canaries"]) != {"queue", "watchdog", "preview"}):
+        raise MonitorError("invalid cutover readiness artifact")
+    coverage, drain, shadow = ready["coverage"], ready["drain"], ready["shadow"]
+    covered, paused, objectives = (coverage["covered_heartbeat_ids"],
+                                   coverage["paused_heartbeat_ids"], coverage["objectives"])
+    if (not isinstance(covered, list) or not covered or any(type(v) is not str or not UUID.fullmatch(v) for v in covered) or
+            not isinstance(paused, list) or sorted(paused) != sorted(covered) or len(set(covered)) != len(covered) or
+            not isinstance(objectives, list) or not objectives or
+            any(type(v) is not str or not LABEL.fullmatch(v) for v in objectives) or len(set(objectives)) != len(objectives) or
+            coverage["complete"] is not True or drain["no_prior_turns"] is not True or
+            drain["method"] not in {"observed_empty", "interval_elapsed"} or
+            shadow["reviewed"] is not True or any(value is not True for value in ready["canaries"].values())):
+        raise MonitorError("incomplete cutover readiness artifact")
+    ready_at = instant(ready["as_of"], "cutover readiness", now, timedelta(minutes=35))
+    paused_at = instant(coverage["paused_at"], "heartbeat pause", now, timedelta(minutes=35))
+    drained_at = instant(drain["confirmed_at"], "hub drain", now, timedelta(minutes=35))
+    if not paused_at <= drained_at <= ready_at or (drain["method"] == "interval_elapsed" and drained_at - paused_at < timedelta(minutes=15)):
+        raise MonitorError("invalid cutover sequence")
+    if (receipt.get("mode") != "shadow" or receipt.get("as_of") != shadow["receipt_as_of"] or
+            snapshot.get("repository") != REPO or snapshot.get("as_of") != receipt.get("as_of") or
+            not isinstance(snapshot.get("entities"), dict)):
+        raise MonitorError("cutover shadow evidence mismatch")
+    instant(receipt["as_of"], "cutover shadow receipt", now, timedelta(minutes=35))
+    for entity, state in snapshot["entities"].items():
+        if state is None:
+            raise MonitorError("invalid cutover snapshot entity")
+        validate_semantic_state(entity, state)
+    baseline = baseline_current(snapshot["entities"], state_dir)
+    if shadow["baseline_id"] != event_id("baseline", None, baseline, 1):
+        raise MonitorError("cutover baseline review mismatch")
+    return ready, snapshot["entities"]
+
+
+def validate_rearm_marker(marker, cursor):
+    baseline = next((event for event in cursor["pending"] if event["entity"] == "baseline"), None)
+    if (not isinstance(marker, dict) or set(marker) != {"version", "failed_at", "baseline_id"} or
+            type(marker["version"]) is not int or marker["version"] != 1 or
+            (marker["baseline_id"] is not None and
+             (type(marker["baseline_id"]) is not str or not re.fullmatch(r"[0-9a-f]{32}", marker["baseline_id"]))) or
+            (baseline is not None and marker["baseline_id"] not in (None, baseline["id"])) or cursor["initialized"]):
+        raise MonitorError("invalid cutover rearm marker")
+    return instant(marker["failed_at"], "cutover rearm failure")
+
+
+def attempt_as_rearm_marker(attempt):
+    if (not isinstance(attempt, dict) or set(attempt) != {"version", "started_at", "baseline_id", "pid"} or
+            type(attempt["version"]) is not int or attempt["version"] != 1 or
+            type(attempt["pid"]) is not int or attempt["pid"] < 1 or
+            (attempt["baseline_id"] is not None and
+             (type(attempt["baseline_id"]) is not str or not re.fullmatch(r"[0-9a-f]{32}", attempt["baseline_id"])))):
+        raise MonitorError("invalid cutover attempt")
+    instant(attempt["started_at"], "cutover attempt")
+    return {"version": 1, "failed_at": attempt["started_at"],
+            "baseline_id": attempt["baseline_id"]}
+
+
+def latest_rearm_marker(marker, attempt):
+    if attempt is None:
+        return marker
+    attempt_marker = attempt_as_rearm_marker(attempt)
+    if marker is None:
+        return attempt_marker
+    if instant(marker["failed_at"], "cutover rearm failure") < instant(attempt["started_at"], "cutover attempt"):
+        return attempt_marker
+    return marker
+
+
+def validate_rearm_ready(ready, marker, cursor):
+    failed_at = validate_rearm_marker(marker, cursor)
+    rearm = ready.get("rearm")
+    if (not isinstance(rearm, dict) or set(rearm) != {"pending_event_ids", "reviewed"} or
+            rearm["reviewed"] is not True or type(rearm["pending_event_ids"]) is not list or
+            rearm["pending_event_ids"] != [event["id"] for event in cursor["pending"]] or
+            instant(ready["as_of"], "cutover rearm readiness") <= failed_at):
+        raise MonitorError("cutover rearm evidence missing or stale")
+
+
 def message(event):
     payload = {"kind": "learnrise_monitor_event", "event_id": event["id"], "repository": REPO,
                "entity": event["entity"], "previous": event["previous"], "current": event["current"],
@@ -421,7 +573,7 @@ def message(event):
     return encoded
 
 
-def deliver(cursor, hub, cursor_path):
+def deliver(cursor, hub, cursor_path, rearm_path, attempt_path):
     for event in cursor["pending"][:]:
         if "silent" not in event:
             queued = bounded_run(["codex", "queue", "--thread", hub, "--message", message(event)], timeout=30)
@@ -431,6 +583,10 @@ def deliver(cursor, hub, cursor_path):
         if event["entity"] == "baseline":
             cursor["initialized"] = True
         atomic(cursor_path, cursor)
+        if event["entity"] == "baseline" and rearm_path.exists():
+            rearm_path.unlink()
+        if event["entity"] == "baseline" and attempt_path.exists():
+            attempt_path.unlink()
 
 
 def run(args):
@@ -438,10 +594,42 @@ def run(args):
     cursor_path = args.state_dir / "learnrise-monitor-cursor.json"
     receipt_path = args.state_dir / "learnrise-monitor-receipt.json"
     fault_path = args.state_dir / "learnrise-monitor-fault.json"
+    rearm_path = args.state_dir / "learnrise-monitor-rearm-required.json"
+    attempt_path = args.state_dir / "learnrise-monitor-cutover-attempt.json"
+    if args.cutover_check:
+        validate_hub(args.hub)
+        ready, _ = validate_cutover_ready(args.state_dir, args.hub, now)
+        marker = read_json(rearm_path, optional=True)
+        attempt = read_json(attempt_path, optional=True)
+        marker = latest_rearm_marker(marker, attempt)
+        cursor = read_json(cursor_path, optional=True) or {"version": 1, "initialized": False,
+                                                            "entities": {}, "pending": []}
+        validate_cursor(cursor, args.state_dir)
+        committed_baseline = cursor["initialized"] and not any(
+            event["entity"] == "baseline" for event in cursor["pending"])
+        if marker is not None and not committed_baseline:
+            validate_rearm_ready(ready, marker, cursor)
+        elif marker is None and "rearm" in ready:
+            raise MonitorError("unexpected cutover rearm evidence")
+        print(json.dumps({"cutover_ready": True, "hub": args.hub}, sort_keys=True))
+        return 0
     if args.status or args.dry_run:
-        cursor = read_json(cursor_path, optional=True) or {}
+        cursor_error = None
+        try:
+            cursor = read_json(cursor_path, optional=True)
+            if cursor is not None:
+                validate_cursor(cursor, args.state_dir)
+        except (MonitorError, OSError, ValueError, TypeError, KeyError, RecursionError, json.JSONDecodeError) as exc:
+            cursor_error = str(exc) or "malformed cursor"
+            cursor = None
+        cursor = cursor or {}
         receipt = read_json(receipt_path, optional=True)
         fault = read_json(fault_path, optional=True)
+        rearm_required = rearm_path.exists() or attempt_path.exists()
+        if cursor_error:
+            fault = {"error": "invalid cursor: " + cursor_error[:300]}
+        if rearm_required:
+            fault = {"error": "cutover rearm required"}
         snapshot = read_json(args.state_dir / "learnrise-monitor-snapshot.json", optional=True)
         stale = receipt is None or snapshot is None
         if receipt:
@@ -460,7 +648,7 @@ def run(args):
         if not isinstance(observed, dict):
             observed = {}
         preview = preview_changes(cursor.get("entities", {}), observed)
-        output = {"initialized": bool(cursor.get("initialized")), "pending": len(cursor.get("pending", [])), "entities": len(observed), "preview_changes": preview, "last_success": receipt, "stale": stale, "fault": fault}
+        output = {"initialized": bool(cursor.get("initialized")), "pending": len(cursor.get("pending", [])), "entities": len(observed), "preview_changes": preview, "last_success": receipt, "stale": stale, "fault": fault, "rearm_required": rearm_required}
         print(json.dumps(output, sort_keys=True))
         return 2 if stale or fault or cursor.get("pending") else 0
     args.state_dir.mkdir(parents=True, exist_ok=True)
@@ -469,11 +657,60 @@ def run(args):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise MonitorError("monitor overlap") from exc
+        cursor = None
+        cursor_valid = False
+        cutover_ready = None
         try:
             cursor = read_json(cursor_path, optional=True)
             if cursor is None:
                 cursor = {"version": 1, "initialized": False, "entities": {}, "pending": []}
             validate_cursor(cursor, args.state_dir)
+            cursor_valid = True
+            pending_baseline = next((event for event in cursor["pending"] if event["entity"] == "baseline"), None)
+            if args.apply and cursor["initialized"] and pending_baseline is None:
+                # The cursor commit is the baseline delivery commit point.
+                # A process killed between that write and marker cleanup must
+                # resume without retrying the already delivered baseline.
+                for completed_marker in (rearm_path, attempt_path):
+                    if completed_marker.exists():
+                        completed_marker.unlink()
+            if pending_baseline is not None:
+                verify_baseline_snapshot(pending_baseline["current"])
+            reviewed_snapshot = None
+            mode_path = args.state_dir / "learnrise-monitor-mode"
+            if args.apply:
+                if not mode_path.exists() or mode_path.stat().st_size > 16 or mode_path.read_text().strip() != "apply":
+                    raise MonitorError("monitor is not activated for apply")
+                marker = read_json(rearm_path, optional=True)
+                attempt = read_json(attempt_path, optional=True)
+                marker = latest_rearm_marker(marker, attempt)
+                if cursor["initialized"]:
+                    if marker is not None or args.rearm or attempt is not None:
+                        raise MonitorError("unexpected cutover rearm state")
+                elif marker is None and not cursor["pending"]:
+                    if args.rearm:
+                        raise MonitorError("unexpected cutover rearm state")
+                    cutover_ready, reviewed_snapshot = validate_cutover_ready(args.state_dir, args.hub, now)
+                    if "rearm" in cutover_ready:
+                        raise MonitorError("unexpected cutover rearm evidence")
+                else:
+                    if marker is None:
+                        baseline = next(event for event in cursor["pending"] if event["entity"] == "baseline")
+                        marker = {"version": 1, "failed_at": now.isoformat(), "baseline_id": baseline["id"]}
+                        atomic(rearm_path, marker)
+                    if not args.rearm:
+                        raise MonitorError("cutover rearm required")
+                    cutover_ready, reviewed_snapshot = validate_cutover_ready(args.state_dir, args.hub, now)
+                    validate_rearm_ready(cutover_ready, marker, cursor)
+            elif args.rearm:
+                raise MonitorError("rearm requires apply")
+            if args.apply and not cursor["initialized"]:
+                # The lock covers this write and the first bridge call. A killed
+                # process leaves a durable disarm signal before any fallible scan.
+                atomic(attempt_path, {"version": 1, "started_at": now.isoformat(),
+                                      "baseline_id": (pending_baseline["id"] if pending_baseline else
+                                                      cutover_ready["shadow"]["baseline_id"]),
+                                      "pid": os.getpid()})
             bridge = bounded_run([sys.executable, str(args.bridge), "--ledger", str(args.ledger), "--audit", str(args.audit), "--outbox", str(args.outbox), "--tasks", str(args.tasks)], timeout=240)
             if bridge.returncode not in (0, 3) or len(bridge.stdout) > MAX_BYTES:
                 raise MonitorError(f"bridge failed ({bridge.returncode})")
@@ -486,21 +723,22 @@ def run(args):
             inventory = report.get("inventory")
             validate_sources(ledger, outbox, supervisor, inventory, args.hub, now)
             snapshot = semantic(ledger, outbox, supervisor, inventory, now)
+            if reviewed_snapshot is not None and snapshot != reviewed_snapshot:
+                raise MonitorError("live state changed since cutover review")
+            shadow_baseline = baseline_current(snapshot, args.state_dir) if args.shadow else None
             atomic(args.state_dir / "learnrise-monitor-snapshot.json", {"as_of": now.isoformat(), "repository": REPO, "entities": snapshot})
             receipt = {"as_of": now.isoformat(), "mode": "shadow" if args.shadow else "apply", "objectives": len(ledger["objectives"]), "open_prs": len(ledger["open_pull_requests"]), "supervisor_open": sum(k.startswith("supervisor:") for k in snapshot)}
             if args.shadow:
                 atomic(receipt_path, receipt)
                 if not cursor["pending"] and fault_path.exists():
                     fault_path.unlink()
-                print(json.dumps({"mode": "shadow", "entities": len(snapshot), "open_prs": len(ledger["open_pull_requests"]), "preview_changes": preview_changes(cursor["entities"], snapshot)}))
+                print(json.dumps({"mode": "shadow", "entities": len(snapshot), "open_prs": len(ledger["open_pull_requests"]), "preview_changes": preview_changes(cursor["entities"], snapshot), "baseline": shadow_baseline, "baseline_event_id": event_id("baseline", None, shadow_baseline, 1)}))
                 return 2 if cursor["pending"] else 0
             first_baseline = not cursor["initialized"] and not any(e["entity"] == "baseline" for e in cursor["pending"])
             if first_baseline:
-                unresolved = sorted(k for k in snapshot if k.startswith(("boss:", "supervisor:")) or (k.startswith("objective:") and snapshot[k].get("gate")) or (k.startswith("dependency:") and not snapshot[k]["satisfied"]))
-                if len(unresolved) > 100:
-                    raise MonitorError("baseline contains too many unresolved IDs for one bounded message")
-                baseline_current = {"counts": {"boss": sum(k.startswith("boss:") for k in unresolved), "supervisor": sum(k.startswith("supervisor:") for k in unresolved), "human_gates": sum(k.startswith("objective:") for k in unresolved), "dependency_gates": sum(k.startswith("dependency:") for k in unresolved)}, "ids": unresolved, "snapshot": str(args.state_dir / "learnrise-monitor-snapshot.json"), "reconcile_only": True}
-                baseline = {"id": event_id("baseline", None, baseline_current, 1), "entity": "baseline", "previous": None, "current": baseline_current, "generation": 1}
+                baseline_state = baseline_current(snapshot, args.state_dir)
+                write_baseline_snapshot(snapshot, baseline_state)
+                baseline = {"id": event_id("baseline", None, baseline_state, 1), "entity": "baseline", "previous": None, "current": baseline_state, "generation": 1}
                 cursor["pending"].append(baseline)
             if first_baseline:
                 # Freeze the source state covered by the baseline. A later scan
@@ -529,13 +767,22 @@ def run(args):
                 # a prior generation or event ID on the same PR head.
                 cursor["entities"][entity] = {"state": current, "generation": generation}
             atomic(cursor_path, cursor)
-            deliver(cursor, args.hub, cursor_path)
+            deliver(cursor, args.hub, cursor_path, rearm_path, attempt_path)
             atomic(receipt_path, receipt)
             if fault_path.exists():
                 fault_path.unlink()
             print(json.dumps({"mode": "apply", "entities": len(snapshot), "pending": len(cursor["pending"])}))
             return 0
         except (MonitorError, OSError, ValueError, TypeError, KeyError, RecursionError, json.JSONDecodeError) as exc:
+            if args.apply and (not cursor_valid or not cursor["initialized"]):
+                baseline = (next((event for event in cursor["pending"] if event["entity"] == "baseline"), None)
+                            if cursor_valid else None)
+                if args.rearm or not rearm_path.exists():
+                    reviewed_id = cutover_ready["shadow"]["baseline_id"] if cutover_ready else None
+                    atomic(rearm_path, {"version": 1, "failed_at": now.isoformat(),
+                                        "baseline_id": baseline["id"] if baseline else reviewed_id})
+                if attempt_path.exists() and rearm_path.exists():
+                    attempt_path.unlink()
             atomic(fault_path, {"as_of": now.isoformat(), "error": str(exc)[:300]})
             raise
 
@@ -547,6 +794,8 @@ def main(argv=None):
     mode.add_argument("--shadow", action="store_true")
     mode.add_argument("--apply", action="store_true")
     mode.add_argument("--status", action="store_true")
+    mode.add_argument("--cutover-check", action="store_true")
+    ap.add_argument("--rearm", action="store_true", help="manually retry a failed cutover baseline after renewed review")
     ap.add_argument("--state-dir", type=Path, default=ARTIFACTS)
     ap.add_argument("--ledger", type=Path, default=ARTIFACTS / "ownership.json")
     ap.add_argument("--audit", type=Path, default=ARTIFACTS / "audit.py")
@@ -557,7 +806,9 @@ def main(argv=None):
     ap.add_argument("--bridge", type=Path, default=Path(__file__).with_name("runtime_bridge.py"))
     ap.add_argument("--hub", default="01a0d565-c171-7120-b828-b04db384021f")
     args = ap.parse_args(argv)
-    if not (args.shadow or args.apply or args.status):
+    if args.rearm and not args.apply:
+        ap.error("--rearm requires --apply")
+    if not (args.shadow or args.apply or args.status or args.cutover_check):
         args.dry_run = True
     try:
         return run(args)

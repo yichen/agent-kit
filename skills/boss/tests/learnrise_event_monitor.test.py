@@ -42,8 +42,49 @@ class MonitorTests(unittest.TestCase):
         monitor.atomic(path / "boss-observed-ledger.json", observed)
         monitor.atomic(path / "boss-action-outbox.json", outbox)
         monitor.atomic(path / "pr-supervisor-state.json", supervisor)
-        return {"actions": [outbox["actions"]["a" * 24]["action"]], "overdue": [],
-                "inventory": {"as_of": now.isoformat(), "tasks": []}}
+        report = {"actions": [outbox["actions"]["a" * 24]["action"]], "overdue": [],
+                  "inventory": {"as_of": now.isoformat(), "tasks": []}}
+        snapshot = monitor.semantic(observed, outbox, supervisor, report["inventory"], now)
+        monitor.atomic(path / "learnrise-monitor-snapshot.json",
+                       {"as_of": now.isoformat(), "repository": monitor.REPO, "entities": snapshot})
+        monitor.atomic(path / "learnrise-monitor-receipt.json", {"as_of": now.isoformat(), "mode": "shadow"})
+        self.cutover_fixture(path, now.isoformat(), snapshot)
+        (path / "learnrise-monitor-mode").write_text("apply\n")
+        return report
+
+    def cutover_fixture(self, path, as_of, snapshot):
+        baseline = monitor.baseline_current(snapshot, path)
+        monitor.atomic(path / "learnrise-monitor-cutover-ready.json",
+                       {"version": 1, "as_of": as_of, "hub": HUB,
+                        "coverage": {"covered_heartbeat_ids": [HUB], "paused_heartbeat_ids": [HUB],
+                                     "objectives": ["#1"], "complete": True, "paused_at": as_of},
+                        "drain": {"confirmed_at": as_of, "method": "observed_empty", "no_prior_turns": True},
+                        "shadow": {"receipt_as_of": as_of,
+                                   "baseline_id": monitor.event_id("baseline", None, baseline, 1),
+                                   "reviewed": True},
+                        "canaries": {"queue": True, "watchdog": True, "preview": True}})
+
+    def rearm_fixture(self, path):
+        receipt = monitor.read_json(path / "learnrise-monitor-receipt.json")
+        snapshot = monitor.read_json(path / "learnrise-monitor-snapshot.json")["entities"]
+        self.cutover_fixture(path, receipt["as_of"], snapshot)
+        ready_path = path / "learnrise-monitor-cutover-ready.json"
+        ready = monitor.read_json(ready_path)
+        cursor = monitor.read_json(path / "learnrise-monitor-cursor.json", optional=True) or {"pending": []}
+        ready["rearm"] = {"pending_event_ids": [event["id"] for event in cursor["pending"]],
+                          "reviewed": True}
+        monitor.atomic(ready_path, ready)
+
+    def refresh_shadow_fixture(self, path, now, report):
+        snapshot = monitor.semantic(monitor.read_json(path / "boss-observed-ledger.json"),
+                                    monitor.read_json(path / "boss-action-outbox.json"),
+                                    monitor.read_json(path / "pr-supervisor-state.json"),
+                                    report["inventory"], now)
+        monitor.atomic(path / "learnrise-monitor-snapshot.json",
+                       {"as_of": now.isoformat(), "repository": monitor.REPO, "entities": snapshot})
+        monitor.atomic(path / "learnrise-monitor-receipt.json",
+                       {"as_of": now.isoformat(), "mode": "shadow"})
+        self.cutover_fixture(path, now.isoformat(), snapshot)
 
     def test_default_dry_run_never_writes_or_runs_processes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -176,6 +217,23 @@ class MonitorTests(unittest.TestCase):
         self.assertNotEqual(monitor.event_id("dependency:gate:device-acceptance", before, after, 1),
                             monitor.event_id("dependency:gate:device-acceptance", after, before, 2))
 
+    def test_completed_ledger_status_wins_over_open_github_issue(self):
+        now = monitor.now_utc()
+        cases = [("OPEN", "COMPLETED", "COMPLETED", False),
+                 ("CLOSED", "COMPLETED", "COMPLETED", False),
+                 ("OPEN", "IN_PROGRESS", "OPEN", True),
+                 ("CLOSED", "IN_PROGRESS", "CLOSED", False)]
+        for github_state, status, expected_state, expected_gate in cases:
+            with self.subTest(github_state=github_state, status=status):
+                ledger = {"dependency_gates": [], "open_pull_requests": [],
+                          "objectives": [{"id": "#1", "github_state": github_state,
+                                          "status": status, "human_gate": True,
+                                          "pull_requests": [], "pull_request_states": {}}]}
+                state = monitor.semantic(ledger, {"actions": {}}, {"actions": {}},
+                                         {"tasks": []}, now)["objective:#1"]
+                self.assertEqual(state["state"], expected_state)
+                self.assertIs(state["gate"], expected_gate)
+
     def test_live_scan_transitions_deliver_owner_task_issue_and_gate_events(self):
         task_id = "01a0d565-c171-7120-b828-b04db384021f"
         cases = [
@@ -191,6 +249,7 @@ class MonitorTests(unittest.TestCase):
                 report = self.fixture(path, now)
                 if change == "task_completion":
                     report["inventory"]["tasks"] = [{"id": task_id, "status": "running"}]
+                    self.refresh_shadow_fixture(path, now, report)
                 args = ["--apply", "--state-dir", str(path),
                         "--observed", str(path / "boss-observed-ledger.json"),
                         "--outbox", str(path / "boss-action-outbox.json"),
@@ -339,8 +398,234 @@ class MonitorTests(unittest.TestCase):
                                                    "--observed", str(path / "boss-observed-ledger.json"),
                                                    "--outbox", str(path / "boss-action-outbox.json"),
                                                    "--supervisor", str(path / "pr-supervisor-state.json")]), 0)
-                self.assertEqual(json.loads(output.getvalue())["preview_changes"], expected)
+                printed = json.loads(output.getvalue())
+                self.assertEqual(printed["preview_changes"], expected)
+                self.assertEqual(printed["baseline"], monitor.baseline_current(observed, path))
+                self.assertEqual(printed["baseline_event_id"],
+                                 monitor.event_id("baseline", None, printed["baseline"], 1))
+                self.assertEqual(printed["baseline"]["counts"],
+                                 {"boss": 1, "supervisor": 1, "human_gates": 1, "dependency_gates": 0})
+                self.assertEqual(printed["baseline"]["ids"],
+                                 sorted(["boss:" + "a" * 24, "supervisor:" + "b" * 20, "objective:#1"]))
                 self.assertEqual(cursor_path.read_bytes(), original)
+
+    def test_shadow_baseline_preview_is_bounded_before_receipt_write(self):
+        cases = [("at_bound", 97, 0), ("over_bound", 98, 2)]
+        for name, gate_count, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                now = monitor.now_utc()
+                report = self.fixture(path, now)
+                observed_path = path / "boss-observed-ledger.json"
+                observed = monitor.read_json(observed_path)
+                observed["dependency_gates"] = [{"id": f"gate:{number}", "satisfied": False}
+                                                for number in range(gate_count)]
+                monitor.atomic(observed_path, observed)
+                receipt_path = path / "learnrise-monitor-receipt.json"
+                snapshot_path = path / "learnrise-monitor-snapshot.json"
+                originals = (receipt_path.read_bytes(), snapshot_path.read_bytes())
+                def runner(argv, timeout=120):
+                    self.assertNotIn("queue", argv)
+                    return Result(3, json.dumps(report))
+                output = io.StringIO()
+                with patch.object(monitor, "bounded_run", side_effect=runner), redirect_stdout(output):
+                    self.assertEqual(monitor.main(["--shadow", "--state-dir", str(path),
+                                                   "--observed", str(observed_path),
+                                                   "--outbox", str(path / "boss-action-outbox.json"),
+                                                   "--supervisor", str(path / "pr-supervisor-state.json")]), expected)
+                if expected == 0:
+                    self.assertEqual(len(json.loads(output.getvalue())["baseline"]["ids"]), 100)
+                else:
+                    self.assertEqual((receipt_path.read_bytes(), snapshot_path.read_bytes()), originals)
+                    self.assertTrue((path / "learnrise-monitor-fault.json").exists())
+
+    def test_status_fails_closed_on_malformed_cursor_without_writes(self):
+        cases = [("truncated", "{"),
+                 ("nested", json.dumps({"version": 1, "initialized": True,
+                                         "entities": {"objective:#1": {"state": {"state": "OPEN"},
+                                                                       "generation": 1}}, "pending": []}))]
+        for name, raw in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                cursor_path = path / "learnrise-monitor-cursor.json"
+                cursor_path.write_text(raw)
+                output = io.StringIO()
+                with patch.object(monitor, "atomic", side_effect=AssertionError("write")), \
+                     patch.object(monitor, "bounded_run", side_effect=AssertionError("process")), \
+                     redirect_stdout(output):
+                    self.assertEqual(monitor.main(["--status", "--state-dir", str(path)]), 2)
+                reported = json.loads(output.getvalue())
+                self.assertIn("invalid cursor", reported["fault"]["error"])
+                self.assertEqual(cursor_path.read_text(), raw)
+                self.assertFalse((path / "learnrise-monitor-fault.json").exists())
+
+    def test_cutover_check_is_read_only_and_rejects_stale_or_incomplete_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            now = monitor.now_utc().isoformat()
+            baseline = monitor.baseline_current({}, path)
+            receipt = {"as_of": now, "mode": "shadow"}
+            snapshot = {"as_of": now, "repository": monitor.REPO, "entities": {}}
+            ready = {"version": 1, "as_of": now, "hub": HUB,
+                     "coverage": {"covered_heartbeat_ids": [HUB], "paused_heartbeat_ids": [HUB],
+                                  "objectives": ["#1"], "complete": True, "paused_at": now},
+                     "drain": {"confirmed_at": now, "method": "observed_empty", "no_prior_turns": True},
+                     "shadow": {"receipt_as_of": now,
+                                "baseline_id": monitor.event_id("baseline", None, baseline, 1),
+                                "reviewed": True},
+                     "canaries": {"queue": True, "watchdog": True, "preview": True}}
+            files = {"learnrise-monitor-receipt.json": receipt,
+                     "learnrise-monitor-snapshot.json": snapshot,
+                     "learnrise-monitor-cutover-ready.json": ready}
+            for name, contents in files.items():
+                monitor.atomic(path / name, contents)
+            cases = [("ready", None, 0),
+                     ("wrong_hub", lambda doc: doc.update(hub="01a0d565-c171-7120-b828-b04db384021e"), 2),
+                     ("unpaused", lambda doc: doc["coverage"].update(paused_heartbeat_ids=[]), 2),
+                     ("unreviewed", lambda doc: doc["shadow"].update(reviewed=False), 2),
+                     ("wrong_baseline", lambda doc: doc["shadow"].update(baseline_id="a" * 32), 2)]
+            for name, mutate, expected in cases:
+                with self.subTest(name=name):
+                    current = copy.deepcopy(ready)
+                    if mutate:
+                        mutate(current)
+                    monitor.atomic(path / "learnrise-monitor-cutover-ready.json", current)
+                    originals = {name: (path / name).read_bytes() for name in files}
+                    with patch.object(monitor, "atomic", side_effect=AssertionError("write")), \
+                         patch.object(monitor, "bounded_run", side_effect=AssertionError("process")), \
+                         patch.object(Path, "mkdir", side_effect=AssertionError("mkdir")), \
+                         redirect_stdout(io.StringIO()):
+                        self.assertEqual(monitor.main(["--cutover-check", "--state-dir", str(path),
+                                                       "--hub", HUB]), expected)
+                    self.assertEqual({name: (path / name).read_bytes() for name in files}, originals)
+
+    def test_installed_first_apply_requires_gate_and_reviewed_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            now = monitor.now_utc()
+            report = self.fixture(path, now)
+            args = ["--apply", "--state-dir", str(path),
+                    "--observed", str(path / "boss-observed-ledger.json"),
+                    "--outbox", str(path / "boss-action-outbox.json"),
+                    "--supervisor", str(path / "pr-supervisor-state.json")]
+            mode = path / "learnrise-monitor-mode"
+            mode.unlink()
+            with patch.object(monitor, "bounded_run", side_effect=AssertionError("bridge or queue ran")):
+                self.assertEqual(monitor.main(args), 2)
+            mode.write_text("shadow\n")
+            with patch.object(monitor, "bounded_run", side_effect=AssertionError("bridge or queue ran")):
+                self.assertEqual(monitor.main(args), 2)
+            self.assertFalse((path / "learnrise-monitor-cursor.json").exists())
+            mode.write_text("apply\n")
+            ledger = monitor.read_json(path / "boss-observed-ledger.json")
+            outbox = monitor.read_json(path / "boss-action-outbox.json")
+            supervisor = monitor.read_json(path / "pr-supervisor-state.json")
+            snapshot = monitor.semantic(ledger, outbox, supervisor, report["inventory"], now)
+            as_of = now.isoformat()
+            monitor.atomic(path / "learnrise-monitor-snapshot.json",
+                           {"as_of": as_of, "repository": monitor.REPO, "entities": snapshot})
+            monitor.atomic(path / "learnrise-monitor-receipt.json", {"as_of": as_of, "mode": "shadow"})
+            baseline = monitor.baseline_current(snapshot, path)
+            monitor.atomic(path / "learnrise-monitor-cutover-ready.json",
+                           {"version": 1, "as_of": as_of, "hub": HUB,
+                            "coverage": {"covered_heartbeat_ids": [HUB], "paused_heartbeat_ids": [HUB],
+                                         "objectives": ["#1"], "complete": True, "paused_at": as_of},
+                            "drain": {"confirmed_at": as_of, "method": "observed_empty", "no_prior_turns": True},
+                            "shadow": {"receipt_as_of": as_of,
+                                       "baseline_id": monitor.event_id("baseline", None, baseline, 1),
+                                       "reviewed": True},
+                            "canaries": {"queue": True, "watchdog": True, "preview": True}})
+            observed_path = path / "boss-observed-ledger.json"
+            changed = copy.deepcopy(ledger)
+            changed["objectives"][0]["human_gate"] = False
+            monitor.atomic(observed_path, changed)
+            queued = []
+            def runner(argv, timeout=120):
+                if "queue" in argv:
+                    queued.append(json.loads(argv[-1]))
+                    return Result()
+                return Result(3, json.dumps(report))
+            with patch.object(monitor, "bounded_run", side_effect=runner):
+                self.assertEqual(monitor.main(args), 2)
+                self.assertEqual(queued, [])
+                self.assertFalse((path / "learnrise-monitor-cursor.json").exists())
+                monitor.atomic(observed_path, ledger)
+                self.assertEqual(monitor.main(args), 2)
+                self.assertEqual(queued, [])
+                self.assertEqual(monitor.main(["--shadow", *args[1:]]), 0)
+                self.rearm_fixture(path)
+                self.assertEqual(monitor.main(["--rearm", *args]), 0)
+            self.assertEqual([event["entity"] for event in queued], ["baseline"])
+            self.assertEqual(queued[0]["event_id"],
+                             monitor.event_id("baseline", None, baseline, 1))
+
+    def test_first_apply_rejects_semantic_drift_with_same_baseline_id(self):
+        task_id = "01a0d565-c171-7120-b828-b04db384021f"
+        cases = [("unchanged", None, 0), ("pr_head", "pr_head", 2),
+                 ("action_status", "action_status", 2), ("task_state", "task_state", 2)]
+        for name, change, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                now = monitor.now_utc()
+                report = self.fixture(path, now)
+                report["inventory"]["tasks"] = [{"id": task_id, "status": "running"}]
+                args = ["--state-dir", str(path),
+                        "--observed", str(path / "boss-observed-ledger.json"),
+                        "--outbox", str(path / "boss-action-outbox.json"),
+                        "--supervisor", str(path / "pr-supervisor-state.json")]
+                queued = []
+                bridge_calls = []
+                def runner(argv, timeout=120):
+                    if "queue" in argv:
+                        queued.append(json.loads(argv[-1]))
+                        return Result()
+                    bridge_calls.append(argv)
+                    return Result(3, json.dumps(report))
+                with patch.object(monitor, "bounded_run", side_effect=runner):
+                    self.assertEqual(monitor.main(["--shadow", *args]), 0)
+                    receipt = monitor.read_json(path / "learnrise-monitor-receipt.json")
+                    shadow = monitor.read_json(path / "learnrise-monitor-snapshot.json")
+                    self.cutover_fixture(path, receipt["as_of"], shadow["entities"])
+                    original_snapshot = (path / "learnrise-monitor-snapshot.json").read_bytes()
+                    original_baseline = monitor.event_id(
+                        "baseline", None, monitor.baseline_current(shadow["entities"], path), 1)
+                    ledger = monitor.read_json(path / "boss-observed-ledger.json")
+                    outbox = monitor.read_json(path / "boss-action-outbox.json")
+                    if change == "pr_head":
+                        ledger["open_pull_requests"][0]["head"] = "b" * 40
+                        monitor.atomic(path / "boss-observed-ledger.json", ledger)
+                    elif change == "action_status":
+                        outbox["actions"]["a" * 24]["state"] = "acknowledged"
+                        outbox["actions"]["a" * 24]["acknowledged_at"] = now.isoformat()
+                        monitor.atomic(path / "boss-action-outbox.json", outbox)
+                    elif change == "task_state":
+                        report["inventory"]["tasks"][0]["status"] = "completed"
+                    changed_snapshot = monitor.semantic(ledger, outbox,
+                                                        monitor.read_json(path / "pr-supervisor-state.json"),
+                                                        report["inventory"], now)
+                    self.assertEqual(monitor.event_id("baseline", None,
+                                     monitor.baseline_current(changed_snapshot, path), 1), original_baseline)
+                    self.assertEqual(monitor.main(["--apply", *args]), expected)
+                    if expected:
+                        if change == "pr_head":
+                            ledger["open_pull_requests"][0]["head"] = "a" * 40
+                            monitor.atomic(path / "boss-observed-ledger.json", ledger)
+                        elif change == "action_status":
+                            outbox["actions"]["a" * 24]["state"] = "pending"
+                            outbox["actions"]["a" * 24].pop("acknowledged_at")
+                            monitor.atomic(path / "boss-action-outbox.json", outbox)
+                        else:
+                            report["inventory"]["tasks"][0]["status"] = "running"
+                        self.assertEqual(monitor.main(["--apply", *args]), 2)
+                        self.assertEqual(len(bridge_calls), 2)
+                if expected:
+                    self.assertEqual(queued, [])
+                    self.assertFalse((path / "learnrise-monitor-cursor.json").exists())
+                    self.assertEqual((path / "learnrise-monitor-snapshot.json").read_bytes(), original_snapshot)
+                    self.assertTrue((path / "learnrise-monitor-fault.json").exists())
+                else:
+                    self.assertEqual([event["entity"] for event in queued], ["baseline"])
+                    self.assertTrue(monitor.read_json(path / "learnrise-monitor-cursor.json")["initialized"])
 
     def test_pending_cursor_schema_and_identity_fail_closed(self):
         activity = "2026-09-28T00:00:00+00:00"
@@ -369,11 +654,7 @@ class MonitorTests(unittest.TestCase):
                 transition = {"id": monitor.event_id("objective:#1", before, after, 2),
                               "entity": "objective:#1", "previous": before, "current": after,
                               "generation": 2}
-                baseline_current = {"counts": {"boss": 0, "supervisor": 0,
-                                                "human_gates": 1, "dependency_gates": 0},
-                                    "ids": ["objective:#1"],
-                                    "snapshot": str(path / "learnrise-monitor-snapshot.json"),
-                                    "reconcile_only": True}
+                baseline_current = monitor.baseline_current({"objective:#1": before}, path)
                 baseline = {"id": monitor.event_id("baseline", None, baseline_current, 1),
                             "entity": "baseline", "previous": None,
                             "current": baseline_current, "generation": 1}
@@ -449,6 +730,7 @@ class MonitorTests(unittest.TestCase):
                 report = self.fixture(path, now)
                 if name == "task_reappears":
                     report["inventory"]["tasks"] = [{"id": task_id, "status": "running"}]
+                    self.refresh_shadow_fixture(path, now, report)
                 args = ["--apply", "--state-dir", str(path),
                         "--observed", str(path / "boss-observed-ledger.json"),
                         "--outbox", str(path / "boss-action-outbox.json"),
@@ -547,7 +829,13 @@ class MonitorTests(unittest.TestCase):
                     queued.append(json.loads(argv[-1]))
                     return Result()
                 bridge_calls.append(argv)
+                self.assertTrue((path / "learnrise-monitor-cutover-attempt.json").exists())
                 nested_results.append(monitor.main(args))
+                fault_calls = []
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(watchdog.check(path, HUB, now=monitor.now_utc(),
+                                                    queue=lambda command: fault_calls.append(command) or Result()), 0)
+                self.assertEqual(fault_calls, [])
                 return Result(3, json.dumps(report))
             with patch.object(monitor, "bounded_run", side_effect=runner):
                 self.assertEqual(monitor.main(args), 0)
@@ -555,6 +843,146 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(len(bridge_calls), 1)
             self.assertEqual([event["entity"] for event in queued], ["baseline"])
             self.assertTrue(monitor.read_json(path / "learnrise-monitor-cursor.json")["initialized"])
+            self.assertFalse((path / "learnrise-monitor-cutover-attempt.json").exists())
+
+    def test_interrupted_first_apply_disarms_scheduled_retry_table(self):
+        for interruption in (KeyboardInterrupt, SystemExit):
+            with self.subTest(interruption=interruption.__name__), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                report = self.fixture(path, monitor.now_utc() - timedelta(minutes=2))
+                args = ["--apply", "--state-dir", str(path),
+                        "--observed", str(path / "boss-observed-ledger.json"),
+                        "--outbox", str(path / "boss-action-outbox.json"),
+                        "--supervisor", str(path / "pr-supervisor-state.json")]
+                with patch.object(monitor, "bounded_run", side_effect=interruption):
+                    with self.assertRaises(interruption):
+                        monitor.main(args)
+                attempt_path = path / "learnrise-monitor-cutover-attempt.json"
+                attempt = monitor.read_json(attempt_path)
+                self.assertEqual(attempt["baseline_id"], monitor.read_json(path / "learnrise-monitor-cutover-ready.json")["shadow"]["baseline_id"])
+                self.assertFalse((path / "learnrise-monitor-cursor.json").exists())
+                outage = []
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(watchdog.check(path, HUB, now=monitor.now_utc(),
+                                                    queue=lambda argv: outage.append(json.loads(argv[-1])) or Result()), 2)
+                self.assertEqual(outage[0]["reason"], "monitor cutover attempt abandoned")
+                calls = []
+                with patch.object(monitor, "bounded_run", side_effect=lambda *a, **k: calls.append(a) or Result()):
+                    self.assertEqual(monitor.main(args), 2)
+                self.assertEqual(calls, [])
+                self.assertTrue((path / "learnrise-monitor-rearm-required.json").exists())
+                self.refresh_shadow_fixture(path, monitor.now_utc() + timedelta(seconds=1), report)
+                self.rearm_fixture(path)
+                queued = []
+                def runner(argv, timeout=120):
+                    if "queue" in argv:
+                        queued.append(json.loads(argv[-1]))
+                        return Result()
+                    return Result(3, json.dumps(report))
+                with patch.object(monitor, "bounded_run", side_effect=runner):
+                    self.assertEqual(monitor.main(["--rearm", *args]), 0)
+                self.assertEqual([event["event_id"] for event in queued], [attempt["baseline_id"]])
+                self.assertFalse(attempt_path.exists())
+
+    def test_shadow_baseline_encoded_message_boundary_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            now = monitor.now_utc()
+            report = self.fixture(path, now)
+            ledger_path = path / "boss-observed-ledger.json"
+            ledger = monitor.read_json(ledger_path)
+            base = monitor.read_json(path / "learnrise-monitor-snapshot.json")["entities"]
+            def gates(count):
+                return [{"id": f"gate-{index:03d}-" + "x" * 91, "satisfied": False}
+                        for index in range(count)]
+            def snapshot(count):
+                return {**base, **{f"dependency:{gate['id']}": {"satisfied": False}
+                                 for gate in gates(count)}}
+            first_over = next(count for count in range(1, 101)
+                              if self.baseline_too_large(snapshot(count), path))
+            self.assertGreater(first_over, 1)
+            args = ["--shadow", "--state-dir", str(path), "--observed", str(ledger_path),
+                    "--outbox", str(path / "boss-action-outbox.json"),
+                    "--supervisor", str(path / "pr-supervisor-state.json")]
+            for count, expected in ((first_over - 1, 0), (first_over, 2)):
+                with self.subTest(count=count, expected=expected):
+                    ledger["dependency_gates"] = gates(count)
+                    monitor.atomic(ledger_path, ledger)
+                    before_receipt = (path / "learnrise-monitor-receipt.json").read_bytes()
+                    before_snapshot = (path / "learnrise-monitor-snapshot.json").read_bytes()
+                    calls = []
+                    def runner(argv, timeout=120):
+                        calls.append(argv)
+                        return Result(3, json.dumps(report))
+                    with patch.object(monitor, "bounded_run", side_effect=runner):
+                        self.assertEqual(monitor.main(args), expected)
+                    self.assertEqual(len(calls), 1)
+                    self.assertFalse((path / "learnrise-monitor-cursor.json").exists())
+                    if expected == 2:
+                        self.assertEqual((path / "learnrise-monitor-receipt.json").read_bytes(), before_receipt)
+                        self.assertEqual((path / "learnrise-monitor-snapshot.json").read_bytes(), before_snapshot)
+                    else:
+                        current = monitor.baseline_current(snapshot(count), path)
+                        encoded = monitor.message({"id": monitor.event_id("baseline", None, current, 1),
+                                                   "entity": "baseline", "previous": None, "current": current})
+                        self.assertLessEqual(len(encoded), 6000)
+
+    def baseline_too_large(self, snapshot, path):
+        try:
+            monitor.baseline_current(snapshot, path)
+            return False
+        except monitor.MonitorError as exc:
+            self.assertIn("message exceeds bound", str(exc))
+            return True
+
+    def test_baseline_cursor_commit_recovers_interrupted_marker_cleanup_table(self):
+        for leftover_rearm in (False, True):
+            with self.subTest(leftover_rearm=leftover_rearm), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                now = monitor.now_utc()
+                report = self.fixture(path, now)
+                args = ["--apply", "--state-dir", str(path),
+                        "--observed", str(path / "boss-observed-ledger.json"),
+                        "--outbox", str(path / "boss-action-outbox.json"),
+                        "--supervisor", str(path / "pr-supervisor-state.json")]
+                attempt_path = path / "learnrise-monitor-cutover-attempt.json"
+                original_unlink = Path.unlink
+                def interrupted_unlink(target, *pos, **kw):
+                    if target == attempt_path:
+                        raise SystemExit("interrupted after cursor commit")
+                    return original_unlink(target, *pos, **kw)
+                queued = []
+                def runner(argv, timeout=120):
+                    if "queue" in argv:
+                        queued.append(json.loads(argv[-1]))
+                        return Result()
+                    return Result(3, json.dumps(report))
+                with patch.object(monitor, "bounded_run", side_effect=runner), patch.object(Path, "unlink", interrupted_unlink):
+                    with self.assertRaises(SystemExit):
+                        monitor.main(args)
+                cursor = monitor.read_json(path / "learnrise-monitor-cursor.json")
+                self.assertTrue(cursor["initialized"])
+                self.assertEqual(cursor["pending"], [])
+                self.assertTrue(attempt_path.exists())
+                self.assertEqual([event["entity"] for event in queued], ["baseline"])
+                if leftover_rearm:
+                    monitor.atomic(path / "learnrise-monitor-rearm-required.json",
+                                   {"version": 1, "failed_at": now.isoformat(),
+                                    "baseline_id": queued[0]["event_id"]})
+                outbox_path = path / "boss-action-outbox.json"
+                outbox = monitor.read_json(outbox_path)
+                new_id = "c" * 24
+                new_action = {"id": new_id, "repo": monitor.REPO, "verb": "RECOVER_OWNER",
+                              "objective": "#1", "pr": 2, "head": "a" * 40}
+                outbox["actions"][new_id] = {"state": "pending", "first_seen": now.isoformat(),
+                                               "action": new_action}
+                monitor.atomic(outbox_path, outbox)
+                report["actions"].append(new_action)
+                with patch.object(monitor, "bounded_run", side_effect=runner):
+                    self.assertEqual(monitor.main(args), 0)
+                self.assertEqual([event["entity"] for event in queued], ["baseline", "boss:" + new_id])
+                self.assertFalse(attempt_path.exists())
+                self.assertFalse((path / "learnrise-monitor-rearm-required.json").exists())
 
     def test_shadow_baseline_queue_failure_restart_and_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -573,6 +1001,9 @@ class MonitorTests(unittest.TestCase):
                 self.assertEqual(monitor.main(["--shadow", *args]), 0)
                 self.assertEqual(queues, [])
                 self.assertFalse((path / "learnrise-monitor-cursor.json").exists())
+                self.cutover_fixture(path,
+                                     monitor.read_json(path / "learnrise-monitor-receipt.json")["as_of"],
+                                     monitor.read_json(path / "learnrise-monitor-snapshot.json")["entities"])
                 self.assertEqual(monitor.main(["--apply", *args]), 2)
                 cursor = monitor.read_json(path / "learnrise-monitor-cursor.json")
                 self.assertFalse(cursor["initialized"])
@@ -580,7 +1011,11 @@ class MonitorTests(unittest.TestCase):
                 baseline = queues[0]
                 self.assertEqual(baseline["current"]["counts"], {"boss": 1, "supervisor": 1, "human_gates": 1, "dependency_gates": 0})
                 self.assertTrue(baseline["current"]["reconcile_only"])
-                self.assertEqual(monitor.main(["--apply", *args]), 0)
+                self.assertEqual(monitor.main(["--apply", *args]), 2)
+                self.assertEqual(len(queues), 1)
+                self.assertEqual(monitor.main(["--shadow", *args]), 2)
+                self.rearm_fixture(path)
+                self.assertEqual(monitor.main(["--apply", "--rearm", *args]), 0)
                 self.assertEqual(queues[0]["event_id"], queues[1]["event_id"])
                 self.assertTrue(monitor.read_json(path / "learnrise-monitor-cursor.json")["initialized"])
                 self.assertEqual(monitor.main(["--apply", *args]), 0)
@@ -605,6 +1040,8 @@ class MonitorTests(unittest.TestCase):
             with patch.object(monitor, "bounded_run", side_effect=runner):
                 self.assertEqual(monitor.main(args), 2)
                 baseline_id = queued[0]["event_id"]
+                immutable_path = Path(queued[0]["current"]["snapshot"])
+                immutable_before = immutable_path.read_bytes()
                 outbox_path = path / "boss-action-outbox.json"
                 outbox = monitor.read_json(outbox_path)
                 new_id = "c" * 24
@@ -614,7 +1051,15 @@ class MonitorTests(unittest.TestCase):
                                               "action": new_action}
                 monitor.atomic(outbox_path, outbox)
                 report["actions"].append(new_action)
-                self.assertEqual(monitor.main(args), 0)
+                self.assertEqual(monitor.main(args), 2)
+                self.assertEqual(len(queued), 1)
+                self.assertEqual(monitor.main(["--shadow", *args[1:]]), 2)
+                self.assertEqual(immutable_path.read_bytes(), immutable_before)
+                self.assertNotIn("boss:" + new_id, monitor.read_json(immutable_path)["entities"])
+                self.assertIn("boss:" + new_id,
+                              monitor.read_json(path / "learnrise-monitor-snapshot.json")["entities"])
+                self.rearm_fixture(path)
+                self.assertEqual(monitor.main(["--rearm", *args]), 0)
                 self.assertEqual([event["entity"] for event in queued],
                                  ["baseline", "baseline", "boss:" + new_id])
                 self.assertEqual(queued[0]["current"]["counts"]["boss"], 1)
@@ -625,6 +1070,96 @@ class MonitorTests(unittest.TestCase):
                 self.assertEqual(cursor["pending"], [])
                 self.assertEqual(monitor.main(args), 0)
                 self.assertEqual(len(queued), 3)
+
+    def test_rearm_keeps_original_baseline_snapshot_when_shadow_state_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            now = monitor.now_utc()
+            report = self.fixture(path, now)
+            args = ["--apply", "--state-dir", str(path),
+                    "--observed", str(path / "boss-observed-ledger.json"),
+                    "--outbox", str(path / "boss-action-outbox.json"),
+                    "--supervisor", str(path / "pr-supervisor-state.json")]
+            queued = []
+            def runner(argv, timeout=120):
+                if "queue" in argv:
+                    queued.append(json.loads(argv[-1]))
+                    return Result(1 if len(queued) == 1 else 0)
+                return Result(3, json.dumps(report))
+            with patch.object(monitor, "bounded_run", side_effect=runner):
+                self.assertEqual(monitor.main(args), 2)
+                original_id = queued[0]["event_id"]
+                original_path = Path(queued[0]["current"]["snapshot"])
+                original_bytes = original_path.read_bytes()
+                outbox_path = path / "boss-action-outbox.json"
+                outbox = monitor.read_json(outbox_path)
+                outbox["actions"]["a" * 24]["state"] = "acknowledged"
+                outbox["actions"]["a" * 24]["acknowledged_at"] = now.isoformat()
+                monitor.atomic(outbox_path, outbox)
+                self.assertEqual(monitor.main(args), 2)
+                self.assertEqual(len(queued), 1)
+                preview_output = io.StringIO()
+                with redirect_stdout(preview_output):
+                    self.assertEqual(monitor.main(["--shadow", *args[1:]]), 2)
+                preview = json.loads(preview_output.getvalue())
+                self.assertEqual(preview["baseline_event_id"], original_id)
+                self.assertNotEqual(preview["baseline"]["snapshot"], str(original_path))
+                self.assertEqual(original_path.read_bytes(), original_bytes)
+                self.assertEqual(monitor.read_json(original_path)["entities"]["boss:" + "a" * 24]["status"], "pending")
+                self.assertEqual(monitor.read_json(path / "learnrise-monitor-snapshot.json")["entities"]["boss:" + "a" * 24]["status"], "acknowledged")
+                self.rearm_fixture(path)
+                self.assertEqual(monitor.main(["--rearm", *args]), 0)
+                self.assertEqual(queued[1]["event_id"], original_id)
+                self.assertEqual(queued[1]["current"]["snapshot"], str(original_path))
+                self.assertEqual([event["entity"] for event in queued],
+                                 ["baseline", "baseline", "boss:" + "a" * 24])
+                self.assertEqual(original_path.read_bytes(), original_bytes)
+
+    def test_rearm_evidence_table_blocks_scheduled_retry_and_preserves_event_id(self):
+        cases = [("missing_rearm_review", lambda ready: ready.pop("rearm")),
+                 ("wrong_pending_id", lambda ready: ready["rearm"].update(pending_event_ids=["a" * 32])),
+                 ("unpaused_coverage", lambda ready: ready["coverage"].update(paused_heartbeat_ids=[])),
+                 ("valid", None)]
+        for name, mutate in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                report = self.fixture(path, monitor.now_utc())
+                args = ["--apply", "--state-dir", str(path),
+                        "--observed", str(path / "boss-observed-ledger.json"),
+                        "--outbox", str(path / "boss-action-outbox.json"),
+                        "--supervisor", str(path / "pr-supervisor-state.json")]
+                queued = []
+                def runner(argv, timeout=120):
+                    if "queue" in argv:
+                        queued.append(json.loads(argv[-1]))
+                        return Result(1 if len(queued) == 1 else 0)
+                    return Result(3, json.dumps(report))
+                with patch.object(monitor, "bounded_run", side_effect=runner):
+                    self.assertEqual(monitor.main(args), 2)
+                    original_id = queued[0]["event_id"]
+                    marker = monitor.read_json(path / "learnrise-monitor-rearm-required.json")
+                    self.assertEqual(marker["baseline_id"], original_id)
+                    self.assertEqual(monitor.main(args), 2)
+                    self.assertEqual(len(queued), 1)
+                    status_output = io.StringIO()
+                    with redirect_stdout(status_output):
+                        self.assertEqual(monitor.main(["--status", "--state-dir", str(path)]), 2)
+                    self.assertTrue(json.loads(status_output.getvalue())["rearm_required"])
+                    self.assertEqual(monitor.main(["--shadow", *args[1:]]), 2)
+                    self.rearm_fixture(path)
+                    if mutate:
+                        ready_path = path / "learnrise-monitor-cutover-ready.json"
+                        ready = monitor.read_json(ready_path)
+                        mutate(ready)
+                        monitor.atomic(ready_path, ready)
+                        self.assertEqual(monitor.main(["--rearm", *args]), 2)
+                        self.assertEqual(len(queued), 1)
+                        self.assertEqual(monitor.main(["--shadow", *args[1:]]), 2)
+                        self.rearm_fixture(path)
+                    self.assertEqual(monitor.main(["--rearm", *args]), 0)
+                    self.assertEqual([event["event_id"] for event in queued],
+                                     [original_id, original_id])
+                    self.assertFalse((path / "learnrise-monitor-rearm-required.json").exists())
 
     def test_new_action_stays_pending_when_baseline_retry_fails_again(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,9 +1186,17 @@ class MonitorTests(unittest.TestCase):
                                "objective": "#1", "pr": 2, "head": "a" * 40}}
                 monitor.atomic(outbox_path, outbox)
                 self.assertEqual(monitor.main(args), 2)
+                self.assertEqual(len(queued), 1)
+                self.assertEqual(monitor.main(["--shadow", *args[1:]]), 2)
+                self.rearm_fixture(path)
+                self.assertEqual(monitor.main(["--rearm", *args]), 2)
                 pending = monitor.read_json(path / "learnrise-monitor-cursor.json")["pending"]
                 self.assertEqual([event["entity"] for event in pending], ["baseline", "boss:" + new_id])
-                self.assertEqual(monitor.main(args), 0)
+                self.assertEqual(monitor.main(args), 2)
+                self.assertEqual(len(queued), 2)
+                self.assertEqual(monitor.main(["--shadow", *args[1:]]), 2)
+                self.rearm_fixture(path)
+                self.assertEqual(monitor.main(["--rearm", *args]), 0)
                 self.assertEqual([event["entity"] for event in queued],
                                  ["baseline", "baseline", "baseline", "boss:" + new_id])
                 self.assertEqual(len({event["event_id"] for event in queued[:3]}), 1)
@@ -661,9 +1204,27 @@ class MonitorTests(unittest.TestCase):
     def test_queue_timeout_does_not_clear_watchdog_outage_during_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
-            (path / "learnrise-monitor-mode").write_text("apply\n")
             now = monitor.now_utc()
             report = self.fixture(path, now)
+            ledger = monitor.read_json(path / "boss-observed-ledger.json")
+            outbox = monitor.read_json(path / "boss-action-outbox.json")
+            supervisor = monitor.read_json(path / "pr-supervisor-state.json")
+            snapshot = monitor.semantic(ledger, outbox, supervisor, report["inventory"], now)
+            as_of = now.isoformat()
+            monitor.atomic(path / "learnrise-monitor-snapshot.json",
+                           {"as_of": as_of, "repository": monitor.REPO, "entities": snapshot})
+            monitor.atomic(path / "learnrise-monitor-receipt.json", {"as_of": as_of, "mode": "shadow"})
+            baseline = monitor.baseline_current(snapshot, path)
+            monitor.atomic(path / "learnrise-monitor-cutover-ready.json",
+                           {"version": 1, "as_of": as_of, "hub": HUB,
+                            "coverage": {"covered_heartbeat_ids": [HUB], "paused_heartbeat_ids": [HUB],
+                                         "objectives": ["#1"], "complete": True, "paused_at": as_of},
+                            "drain": {"confirmed_at": as_of, "method": "observed_empty", "no_prior_turns": True},
+                            "shadow": {"receipt_as_of": as_of,
+                                       "baseline_id": monitor.event_id("baseline", None, baseline, 1),
+                                       "reviewed": True},
+                            "canaries": {"queue": True, "watchdog": True, "preview": True}})
+            (path / "learnrise-monitor-mode").write_text("apply\n")
             args = ["--apply", "--state-dir", str(path),
                     "--observed", str(path / "boss-observed-ledger.json"),
                     "--outbox", str(path / "boss-action-outbox.json"),
@@ -688,18 +1249,27 @@ class MonitorTests(unittest.TestCase):
                 return Result()
             with patch.object(monitor, "bounded_run", side_effect=runner):
                 self.assertEqual(monitor.main(args), 2)
-                self.assertIsNone(monitor.read_json(path / "learnrise-monitor-receipt.json", optional=True))
+                self.assertEqual(monitor.read_json(path / "learnrise-monitor-receipt.json")["mode"], "shadow")
                 self.assertEqual(watchdog.check(path, HUB, now=now, queue=fault_queue), 2)
                 first_alert = monitor.read_json(path / "learnrise-watchdog-alert.json")["event_id"]
+                self.assertEqual(hub_faults[0]["reason"], "monitor cutover rearm required")
                 self.assertEqual(len(hub_faults), 1)
                 self.assertEqual(monitor.main(args), 2)
+                self.assertEqual(len(queue_attempts), 1)
+                self.assertEqual(monitor.main(["--shadow", *args[1:]]), 2)
+                self.rearm_fixture(path)
+                self.assertEqual(monitor.main(["--rearm", *args]), 2)
                 self.assertEqual(alert_ids_during_queue, [first_alert])
                 self.assertTrue((path / "learnrise-monitor-fault.json").exists())
-                self.assertIsNone(monitor.read_json(path / "learnrise-monitor-receipt.json", optional=True))
+                self.assertEqual(monitor.read_json(path / "learnrise-monitor-receipt.json")["mode"], "shadow")
                 self.assertEqual(watchdog.check(path, HUB, now=now + timedelta(minutes=1),
                                                 queue=fault_queue), 2)
                 self.assertEqual(len(hub_faults), 1)
-                self.assertEqual(monitor.main(args), 0)
+                self.assertEqual(monitor.main(args), 2)
+                self.assertEqual(len(queue_attempts), 2)
+                self.assertEqual(monitor.main(["--shadow", *args[1:]]), 2)
+                self.rearm_fixture(path)
+                self.assertEqual(monitor.main(["--rearm", *args]), 0)
                 self.assertFalse((path / "learnrise-monitor-fault.json").exists())
                 self.assertIsNotNone(monitor.read_json(path / "learnrise-monitor-receipt.json"))
                 self.assertEqual(watchdog.check(path, HUB, now=monitor.now_utc(), queue=fault_queue), 0)
@@ -709,13 +1279,16 @@ class MonitorTests(unittest.TestCase):
     def test_bridge_failure_persists_fault_without_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
+            self.fixture(path, monitor.now_utc())
             calls = []
             def runner(argv, timeout=120):
                 calls.append(argv)
                 return Result(2, "bad")
             with patch.object(monitor, "bounded_run", side_effect=runner):
                 self.assertEqual(monitor.main(["--apply", "--state-dir", str(path)]), 2)
+                self.assertEqual(monitor.main(["--apply", "--state-dir", str(path)]), 2)
             self.assertEqual(len(calls), 1)
+            self.assertTrue((path / "learnrise-monitor-rearm-required.json").exists())
             self.assertTrue((path / "learnrise-monitor-fault.json").exists())
 
     def test_pending_ci_does_not_change_semantics_but_failed_ci_does(self):
