@@ -579,7 +579,8 @@ class MonitorTests(unittest.TestCase):
             receipt = {"as_of": now, "mode": "shadow"}
             snapshot = {"as_of": now, "repository": monitor.REPO, "entities": {}}
             ready = {"version": 1, "as_of": now, "hub": HUB,
-                     "coverage": {"covered_heartbeat_ids": [HUB], "paused_heartbeat_ids": [HUB],
+                     "coverage": {"covered_heartbeat_ids": ["learnrise-519-monitor"],
+                                  "paused_heartbeat_ids": ["learnrise-519-monitor"],
                                   "objectives": ["#1"], "complete": True, "paused_at": now},
                      "drain": {"confirmed_at": now, "method": "observed_empty", "no_prior_turns": True},
                      "shadow": {"receipt_as_of": now,
@@ -594,6 +595,11 @@ class MonitorTests(unittest.TestCase):
             cases = [("ready", None, 0),
                      ("wrong_hub", lambda doc: doc.update(hub="01a0d565-c171-7120-b828-b04db384021e"), 2),
                      ("unpaused", lambda doc: doc["coverage"].update(paused_heartbeat_ids=[]), 2),
+                     ("injected_automation_id", lambda doc: doc["coverage"].update(
+                         covered_heartbeat_ids=["learnrise-519-monitor;touch /tmp/pwn"],
+                         paused_heartbeat_ids=["learnrise-519-monitor;touch /tmp/pwn"]), 2),
+                     ("empty_automation_id", lambda doc: doc["coverage"].update(
+                         covered_heartbeat_ids=[""], paused_heartbeat_ids=[""]), 2),
                      ("unreviewed", lambda doc: doc["shadow"].update(reviewed=False), 2),
                      ("wrong_baseline", lambda doc: doc["shadow"].update(baseline_id="a" * 32), 2)]
             for name, mutate, expected in cases:
