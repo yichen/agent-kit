@@ -406,6 +406,11 @@ def meaningful(entity, before, after):
     return True
 
 
+def preview_changes(entities, observed):
+    return sum(entities.get(entity, {}).get("state") != observed.get(entity)
+               for entity in entities.keys() | observed.keys())
+
+
 def message(event):
     payload = {"kind": "learnrise_monitor_event", "event_id": event["id"], "repository": REPO,
                "entity": event["entity"], "previous": event["previous"], "current": event["current"],
@@ -454,7 +459,7 @@ def run(args):
         observed = (snapshot or {}).get("entities", {})
         if not isinstance(observed, dict):
             observed = {}
-        preview = sum(cursor.get("entities", {}).get(k, {}).get("state") != v for k, v in observed.items())
+        preview = preview_changes(cursor.get("entities", {}), observed)
         output = {"initialized": bool(cursor.get("initialized")), "pending": len(cursor.get("pending", [])), "entities": len(observed), "preview_changes": preview, "last_success": receipt, "stale": stale, "fault": fault}
         print(json.dumps(output, sort_keys=True))
         return 2 if stale or fault or cursor.get("pending") else 0
@@ -487,7 +492,7 @@ def run(args):
                 atomic(receipt_path, receipt)
                 if not cursor["pending"] and fault_path.exists():
                     fault_path.unlink()
-                print(json.dumps({"mode": "shadow", "entities": len(snapshot), "open_prs": len(ledger["open_pull_requests"]), "preview_changes": sum(cursor["entities"].get(k, {}).get("state") != v for k, v in snapshot.items())}))
+                print(json.dumps({"mode": "shadow", "entities": len(snapshot), "open_prs": len(ledger["open_pull_requests"]), "preview_changes": preview_changes(cursor["entities"], snapshot)}))
                 return 2 if cursor["pending"] else 0
             first_baseline = not cursor["initialized"] and not any(e["entity"] == "baseline" for e in cursor["pending"])
             if first_baseline:

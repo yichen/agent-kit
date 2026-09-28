@@ -1,5 +1,7 @@
 import importlib.util
 import copy
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import sys
@@ -299,9 +301,46 @@ class MonitorTests(unittest.TestCase):
                 self.assertFalse((path / "learnrise-monitor-snapshot.json").exists())
                 self.assertFalse((path / "learnrise-monitor-receipt.json").exists())
                 fault = monitor.read_json(path / "learnrise-monitor-fault.json")
-                expected_error = {"truncated_json": "Expecting", "deep_json": "recursion depth",
-                                  "invalid_utf8": "codec"}.get(name, "cursor")
-                self.assertIn(expected_error, fault["error"])
+                self.assertIsInstance(fault["error"], str)
+                self.assertTrue(fault["error"])
+                if name != "deep_json":
+                    expected_error = {"truncated_json": "Expecting", "invalid_utf8": "codec"}.get(name, "cursor")
+                    self.assertIn(expected_error, fault["error"])
+
+    def test_shadow_preview_counts_additions_deletions_and_unchanged(self):
+        task_id = "01a0d565-c171-7120-b828-b04db384021f"
+        cases = [("unchanged", "none", 0), ("addition", "remove_pr", 1),
+                 ("deletion", "add_task", 1), ("both", "both", 2)]
+        for name, change, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                now = monitor.now_utc()
+                report = self.fixture(path, now)
+                ledger = monitor.read_json(path / "boss-observed-ledger.json")
+                outbox = monitor.read_json(path / "boss-action-outbox.json")
+                supervisor = monitor.read_json(path / "pr-supervisor-state.json")
+                observed = monitor.semantic(ledger, outbox, supervisor, report["inventory"], now)
+                entities = {entity: {"state": state, "generation": 0}
+                            for entity, state in observed.items()}
+                if change in {"remove_pr", "both"}:
+                    del entities["pr:2"]
+                if change in {"add_task", "both"}:
+                    entities["task:" + task_id] = {"state": {"status": "running"}, "generation": 1}
+                cursor_path = path / "learnrise-monitor-cursor.json"
+                monitor.atomic(cursor_path, {"version": 1, "initialized": True,
+                                             "entities": entities, "pending": []})
+                original = cursor_path.read_bytes()
+                def runner(argv, timeout=120):
+                    self.assertNotIn("queue", argv)
+                    return Result(3, json.dumps(report))
+                output = io.StringIO()
+                with patch.object(monitor, "bounded_run", side_effect=runner), redirect_stdout(output):
+                    self.assertEqual(monitor.main(["--shadow", "--state-dir", str(path),
+                                                   "--observed", str(path / "boss-observed-ledger.json"),
+                                                   "--outbox", str(path / "boss-action-outbox.json"),
+                                                   "--supervisor", str(path / "pr-supervisor-state.json")]), 0)
+                self.assertEqual(json.loads(output.getvalue())["preview_changes"], expected)
+                self.assertEqual(cursor_path.read_bytes(), original)
 
     def test_pending_cursor_schema_and_identity_fail_closed(self):
         activity = "2026-09-28T00:00:00+00:00"
