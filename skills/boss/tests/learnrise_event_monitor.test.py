@@ -1,4 +1,5 @@
 import importlib.util
+import copy
 import json
 from pathlib import Path
 import sys
@@ -62,6 +63,9 @@ class MonitorTests(unittest.TestCase):
             ("task:x", {"status": "running"}, {"status": "completed"}, True),
             ("objective:#1", {"state": "OPEN"}, {"state": "CLOSED"}, True),
             ("objective:#1", {"activity": "a"}, {"activity": "b"}, True),
+            ("objective:#2", None, {"state": "OPEN", "gate": True}, True),
+            ("objective:#2", None, {"state": "OPEN", "gate": False}, False),
+            ("objective:#2", None, {"state": "CLOSED", "gate": False}, False),
             ("boss:a", {"overdue_stage": 0}, {"overdue_stage": 1}, True),
         ]
         for entity, before, after, expected in cases:
@@ -229,6 +233,266 @@ class MonitorTests(unittest.TestCase):
                     self.assertEqual(monitor.main(args), 0)
                     self.assertEqual(len(queued), 2)
                     self.assertEqual(len(bridge_calls), 4)
+
+    def test_new_human_gate_wakes_after_baseline_but_benign_objective_does_not(self):
+        cases = [("open_human_gate", "OPEN", True, True),
+                 ("open_benign", "OPEN", False, False),
+                 ("closed_old_gate", "CLOSED", True, False)]
+        for name, state, human_gate, should_wake in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                now = monitor.now_utc()
+                report = self.fixture(path, now)
+                args = ["--apply", "--state-dir", str(path),
+                        "--observed", str(path / "boss-observed-ledger.json"),
+                        "--outbox", str(path / "boss-action-outbox.json"),
+                        "--supervisor", str(path / "pr-supervisor-state.json")]
+                queued = []
+                def runner(argv, timeout=120):
+                    if "queue" in argv:
+                        queued.append(json.loads(argv[-1]))
+                        return Result()
+                    return Result(3, json.dumps(report))
+                with patch.object(monitor, "bounded_run", side_effect=runner):
+                    self.assertEqual(monitor.main(args), 0)
+                    self.assertEqual([item["entity"] for item in queued], ["baseline"])
+                    self.assertEqual(queued[0]["current"]["counts"]["human_gates"], 1)
+                    observed_path = path / "boss-observed-ledger.json"
+                    observed = monitor.read_json(observed_path)
+                    observed["objectives"].append({"id": "#2", "github_state": state,
+                                                   "human_gate": human_gate,
+                                                   "last_activity_utc": now.isoformat(),
+                                                   "pull_requests": [], "pull_request_states": {}})
+                    monitor.atomic(observed_path, observed)
+                    if human_gate and state == "OPEN":
+                        report["waiting"] = [{"objective": "#2", "reason": "human_gate"}]
+                    self.assertEqual(monitor.main(args), 0)
+                    self.assertEqual([item["entity"] for item in queued[1:]],
+                                     ["objective:#2"] if should_wake else [])
+                    self.assertEqual(monitor.main(args), 0)
+                    self.assertEqual(len(queued), 2 if should_wake else 1)
+
+    def test_malformed_cursor_fails_before_bridge_with_durable_fault(self):
+        valid = {"version": 1, "initialized": True, "entities": {}, "pending": []}
+        cases = [
+            ("truncated_json", "{"),
+            ("deep_json", '{"version":1,"initialized":true,"entities":' + "[" * 1200 + "0" + "]" * 1200 + ',"pending":[]}'),
+            ("invalid_utf8", b"\xff"),
+            ("top_level_array", "[]"),
+            ("missing_top_level", "{}"),
+            ("nested_generation_missing", json.dumps({**valid, "entities": {"objective:#1": {"state": {"state": "OPEN"}}}})),
+            ("nested_generation_text", json.dumps({**valid, "entities": {"objective:#1": {"state": None, "generation": "1"}}})),
+            ("nested_state_list", json.dumps({**valid, "entities": {"objective:#1": {"state": [], "generation": 1}}})),
+            ("pending_event_id_missing", json.dumps({**valid, "pending": [{"entity": "objective:#1", "previous": None, "current": {}}]})),
+            ("pending_event_id_malformed", json.dumps({**valid, "pending": [{"id": "$(touch /tmp/pwn)", "entity": "objective:#1", "previous": None, "current": {}}]})),
+            ("pending_current_list", json.dumps({**valid, "pending": [{"id": "a" * 32, "entity": "objective:#1", "previous": None, "current": []}]})),
+        ]
+        for name, raw in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                cursor_path = path / "learnrise-monitor-cursor.json"
+                original = raw if isinstance(raw, bytes) else raw.encode()
+                cursor_path.write_bytes(original)
+                with patch.object(monitor, "bounded_run", side_effect=AssertionError("bridge or queue ran")):
+                    self.assertEqual(monitor.main(["--apply", "--state-dir", str(path)]), 2)
+                self.assertEqual(cursor_path.read_bytes(), original)
+                self.assertFalse((path / "learnrise-monitor-snapshot.json").exists())
+                self.assertFalse((path / "learnrise-monitor-receipt.json").exists())
+                fault = monitor.read_json(path / "learnrise-monitor-fault.json")
+                expected_error = {"truncated_json": "Expecting", "deep_json": "recursion depth",
+                                  "invalid_utf8": "codec"}.get(name, "cursor")
+                self.assertIn(expected_error, fault["error"])
+
+    def test_pending_cursor_schema_and_identity_fail_closed(self):
+        activity = "2026-09-28T00:00:00+00:00"
+        before = {"state": "OPEN", "prs": [], "gate": True, "activity": activity}
+        after = {**before, "activity": "2026-09-28T00:01:00+00:00"}
+        mutations = [
+            ("numeric_id", "transition", lambda c: c["pending"][0].update(id=int("1" * 32))),
+            ("wrong_id", "transition", lambda c: c["pending"][0].update(id="a" * 32)),
+            ("generation_bool", "transition", lambda c: c["pending"][0].update(generation=True)),
+            ("generation_out_of_range", "transition", lambda c: c["pending"][0].update(generation=3)),
+            ("forged_entity", "transition", lambda c: c["pending"][0].update(entity="objective:#2")),
+            ("pending_previous_extra", "transition", lambda c: c["pending"][0]["previous"].update(command="$(touch /tmp/pwn)")),
+            ("pending_current_missing", "transition", lambda c: c["pending"][0]["current"].pop("prs")),
+            ("pending_current_bad_gate", "transition", lambda c: c["pending"][0]["current"].update(gate="true")),
+            ("entity_state_extra", "transition", lambda c: c["entities"]["objective:#1"]["state"].update(command="$(touch /tmp/pwn)")),
+            ("entity_state_bad_enum", "transition", lambda c: c["entities"]["objective:#1"]["state"].update(state=["OPEN"])),
+            ("baseline_wrong_id", "baseline", lambda c: c["pending"][0].update(id="a" * 32)),
+            ("baseline_bad_counts", "baseline", lambda c: c["pending"][0]["current"]["counts"].update(human_gates=2)),
+            ("baseline_bad_entity", "baseline", lambda c: c["pending"][0]["current"]["ids"].append("task:$(touch /tmp/pwn)")),
+            ("baseline_bad_snapshot", "baseline", lambda c: c["pending"][0]["current"].update(snapshot="/tmp/other")),
+            ("baseline_silent_forgery", "baseline", lambda c: c["pending"][0].update(silent=True)),
+        ]
+        for name, kind, mutate in mutations:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                transition = {"id": monitor.event_id("objective:#1", before, after, 2),
+                              "entity": "objective:#1", "previous": before, "current": after,
+                              "generation": 2}
+                baseline_current = {"counts": {"boss": 0, "supervisor": 0,
+                                                "human_gates": 1, "dependency_gates": 0},
+                                    "ids": ["objective:#1"],
+                                    "snapshot": str(path / "learnrise-monitor-snapshot.json"),
+                                    "reconcile_only": True}
+                baseline = {"id": monitor.event_id("baseline", None, baseline_current, 1),
+                            "entity": "baseline", "previous": None,
+                            "current": baseline_current, "generation": 1}
+                valid = ({"version": 1, "initialized": True,
+                          "entities": {"objective:#1": {"state": after, "generation": 2}},
+                          "pending": [transition]} if kind == "transition" else
+                         {"version": 1, "initialized": False,
+                          "entities": {"objective:#1": {"state": before, "generation": 0}},
+                          "pending": [baseline]})
+                monitor.validate_cursor(valid, path)
+                malformed = copy.deepcopy(valid)
+                mutate(malformed)
+                original = json.dumps(malformed).encode()
+                cursor_path = path / "learnrise-monitor-cursor.json"
+                cursor_path.write_bytes(original)
+                with patch.object(monitor, "bounded_run", side_effect=AssertionError("bridge or queue ran")):
+                    self.assertEqual(monitor.main(["--apply", "--state-dir", str(path)]), 2)
+                self.assertEqual(cursor_path.read_bytes(), original)
+                self.assertFalse((path / "learnrise-monitor-snapshot.json").exists())
+                self.assertFalse((path / "learnrise-monitor-receipt.json").exists())
+                self.assertTrue((path / "learnrise-monitor-fault.json").exists())
+
+    def test_pending_transition_chains_are_contiguous_and_end_at_cursor(self):
+        states = [{"state": "OPEN", "prs": [], "gate": True,
+                   "activity": f"2026-09-28T00:0{minute}:00+00:00"} for minute in range(3)]
+        def make_event(before, after, generation):
+            return {"id": monitor.event_id("objective:#1", before, after, generation),
+                    "entity": "objective:#1", "previous": before, "current": after,
+                    "generation": generation}
+        cases = [
+            ("duplicate_id", lambda c: c["pending"].append(copy.deepcopy(c["pending"][0]))),
+            ("generation_gap", lambda c: c["pending"][1].update(generation=4)),
+            ("broken_previous", lambda c: c["pending"][1].update(previous=states[0])),
+            ("stale_endpoint", lambda c: c["entities"]["objective:#1"].update(state=states[1])),
+            ("stale_generation", lambda c: c["entities"]["objective:#1"].update(generation=4)),
+            ("reversed_order", lambda c: c["pending"].reverse()),
+            ("unrelated_current", lambda c: c["pending"][1].update(current=states[0])),
+            ("forged_silent_meaningful", lambda c: c["pending"][1].update(silent=True)),
+            ("invalid_silent_flag", lambda c: c["pending"][1].update(silent=False)),
+        ]
+        for name, mutate in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                valid = {"version": 1, "initialized": True,
+                         "entities": {"objective:#1": {"state": states[2], "generation": 3}},
+                         "pending": [make_event(states[0], states[1], 2),
+                                     make_event(states[1], states[2], 3)]}
+                monitor.validate_cursor(valid, path)
+                malformed = copy.deepcopy(valid)
+                mutate(malformed)
+                # Keep mutated transition IDs internally consistent to isolate
+                # chain validation from identity validation.
+                for event in malformed["pending"]:
+                    event["id"] = monitor.event_id(event["entity"], event["previous"],
+                                                   event["current"], event["generation"])
+                original = json.dumps(malformed).encode()
+                cursor_path = path / "learnrise-monitor-cursor.json"
+                cursor_path.write_bytes(original)
+                with patch.object(monitor, "bounded_run", side_effect=AssertionError("bridge or queue ran")):
+                    self.assertEqual(monitor.main(["--apply", "--state-dir", str(path)]), 2)
+                self.assertEqual(cursor_path.read_bytes(), original)
+                self.assertFalse((path / "learnrise-monitor-snapshot.json").exists())
+                self.assertTrue((path / "learnrise-monitor-fault.json").exists())
+
+    def test_suppressed_transitions_survive_queue_failure_restart(self):
+        task_id = "01a0d565-c171-7120-b828-b04db384021f"
+        cases = [("task_reappears", "task:" + task_id),
+                 ("objective_benign_readd", "objective:#1")]
+        for name, entity in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                now = monitor.now_utc()
+                report = self.fixture(path, now)
+                if name == "task_reappears":
+                    report["inventory"]["tasks"] = [{"id": task_id, "status": "running"}]
+                args = ["--apply", "--state-dir", str(path),
+                        "--observed", str(path / "boss-observed-ledger.json"),
+                        "--outbox", str(path / "boss-action-outbox.json"),
+                        "--supervisor", str(path / "pr-supervisor-state.json")]
+                queued = []
+                def runner(argv, timeout=120):
+                    if "queue" in argv:
+                        queued.append(json.loads(argv[-1]))
+                        return Result(1 if len(queued) in {2, 3, 4} else 0)
+                    return Result(3, json.dumps(report))
+                with patch.object(monitor, "bounded_run", side_effect=runner):
+                    self.assertEqual(monitor.main(args), 0)
+                    if name == "task_reappears":
+                        report["inventory"]["tasks"][0]["status"] = "completed"
+                    else:
+                        observed_path = path / "boss-observed-ledger.json"
+                        observed = monitor.read_json(observed_path)
+                        observed["objectives"][0]["last_activity_utc"] = (now + timedelta(minutes=1)).isoformat()
+                        monitor.atomic(observed_path, observed)
+                    self.assertEqual(monitor.main(args), 2)
+                    if name == "task_reappears":
+                        report["inventory"]["tasks"] = []
+                    else:
+                        observed = monitor.read_json(observed_path)
+                        observed["objectives"] = []
+                        monitor.atomic(observed_path, observed)
+                    self.assertEqual(monitor.main(args), 2)
+                    if name == "task_reappears":
+                        report["inventory"]["tasks"] = [{"id": task_id, "status": "running"}]
+                    else:
+                        observed = monitor.read_json(observed_path)
+                        observed["objectives"] = [{"id": "#1", "github_state": "OPEN",
+                                                   "human_gate": False, "pull_requests": [],
+                                                   "pull_request_states": {}}]
+                        monitor.atomic(observed_path, observed)
+                    # This scan appends a suppressed transition while the prior
+                    # queued event is still pending. A restarted scan must accept it.
+                    self.assertEqual(monitor.main(args), 2)
+                    cursor_path = path / "learnrise-monitor-cursor.json"
+                    cursor = monitor.read_json(cursor_path)
+                    self.assertEqual([event.get("silent", False) for event in cursor["pending"]],
+                                     [False, False, True])
+                    monitor.validate_cursor(cursor, path)
+                    self.assertEqual(monitor.main(args), 0)
+                    self.assertEqual([event["entity"] for event in queued],
+                                     ["baseline", entity, entity, entity, entity, entity])
+                    self.assertEqual(monitor.read_json(cursor_path)["pending"], [])
+
+    def test_multiple_generations_retry_in_order_after_queue_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            now = monitor.now_utc()
+            report = self.fixture(path, now)
+            args = ["--apply", "--state-dir", str(path),
+                    "--observed", str(path / "boss-observed-ledger.json"),
+                    "--outbox", str(path / "boss-action-outbox.json"),
+                    "--supervisor", str(path / "pr-supervisor-state.json")]
+            queued = []
+            def runner(argv, timeout=120):
+                if "queue" in argv:
+                    queued.append(json.loads(argv[-1]))
+                    return Result(1 if len(queued) in {2, 3} else 0)
+                return Result(3, json.dumps(report))
+            with patch.object(monitor, "bounded_run", side_effect=runner):
+                self.assertEqual(monitor.main(args), 0)
+                observed_path = path / "boss-observed-ledger.json"
+                for minutes in (1, 2):
+                    observed = monitor.read_json(observed_path)
+                    observed["objectives"][0]["last_activity_utc"] = (now + timedelta(minutes=minutes)).isoformat()
+                    monitor.atomic(observed_path, observed)
+                    self.assertEqual(monitor.main(args), 2)
+                cursor_path = path / "learnrise-monitor-cursor.json"
+                cursor = monitor.read_json(cursor_path)
+                self.assertEqual([event["generation"] for event in cursor["pending"]], [1, 2])
+                monitor.validate_cursor(cursor, path)
+                self.assertEqual(monitor.main(args), 0)
+                self.assertEqual([event["entity"] for event in queued],
+                                 ["baseline", "objective:#1", "objective:#1",
+                                  "objective:#1", "objective:#1"])
+                self.assertEqual(queued[1]["event_id"], queued[2]["event_id"])
+                self.assertEqual(queued[2]["event_id"], queued[3]["event_id"])
+                self.assertNotEqual(queued[3]["event_id"], queued[4]["event_id"])
+                self.assertEqual(monitor.read_json(cursor_path)["pending"], [])
 
     def test_overlapping_monitor_run_does_not_scan_or_queue_twice(self):
         with tempfile.TemporaryDirectory() as tmp:

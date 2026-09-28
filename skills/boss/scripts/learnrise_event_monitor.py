@@ -222,6 +222,169 @@ def semantic(ledger, outbox, supervisor, inventory, now):
     return result
 
 
+def entity_kind(entity):
+    if not isinstance(entity, str):
+        raise MonitorError("invalid cursor entity")
+    prefix, separator, identifier = entity.partition(":")
+    if not separator:
+        raise MonitorError("invalid cursor entity")
+    valid = {
+        "objective": lambda: LABEL.fullmatch(identifier),
+        "pr": lambda: re.fullmatch(r"[1-9][0-9]{0,9}", identifier),
+        "task": lambda: UUID.fullmatch(identifier),
+        "boss": lambda: re.fullmatch(r"[0-9a-f]{24}", identifier),
+        "supervisor": lambda: re.fullmatch(r"[0-9a-f]{20}", identifier),
+        "dependency": lambda: GATE_ID.fullmatch(identifier),
+    }
+    if prefix not in valid or not valid[prefix]():
+        raise MonitorError("invalid cursor entity")
+    return prefix
+
+
+def enum(value, choices):
+    return type(value) is str and value in choices
+
+
+def validate_semantic_state(entity, state):
+    kind = entity_kind(entity)
+    if state is None:
+        return
+    if not isinstance(state, dict):
+        raise MonitorError("invalid cursor semantic state")
+    keys = set(state)
+    if kind == "objective":
+        if keys != {"state", "prs", "gate", "activity"} or not enum(state["state"], {"OPEN", "CLOSED", "COMPLETED"}) or type(state["gate"]) is not bool or not isinstance(state["prs"], list) or len(state["prs"]) > 1000:
+            raise MonitorError("invalid objective cursor state")
+        if (state["gate"] and state["state"] != "OPEN") or (not state["gate"] and state["activity"] is not None):
+            raise MonitorError("invalid objective gate state")
+        if state["activity"] is not None:
+            instant(state["activity"], "cursor issue activity")
+        numbers = set()
+        for pr in state["prs"]:
+            if (not isinstance(pr, list) or len(pr) != 3 or type(pr[0]) is not int or pr[0] < 1 or
+                    pr[0] in numbers or (pr[1] is not None and not enum(pr[1], {"OPEN", "MERGED", "CLOSED"})) or
+                    (pr[2] is not None and (not isinstance(pr[2], str) or not SHA.fullmatch(pr[2])))):
+                raise MonitorError("invalid objective PR cursor state")
+            numbers.add(pr[0])
+    elif kind == "pr":
+        if (keys != {"head", "objective", "merge", "review", "failed_check_count"} or
+                not isinstance(state["head"], str) or not SHA.fullmatch(state["head"]) or
+                (state["objective"] is not None and (not isinstance(state["objective"], str) or not LABEL.fullmatch(state["objective"]))) or
+                not enum(state["merge"], {"CLEAN", "DIRTY", "UNKNOWN"}) or
+                not enum(state["review"], {"APPROVED", "CHANGES_REQUESTED", "STALE", "MISSING"}) or
+                type(state["failed_check_count"]) is not int or state["failed_check_count"] < 0):
+            raise MonitorError("invalid PR cursor state")
+    elif kind == "task":
+        if keys != {"status"} or not enum(state["status"], {"queued", "running", "completed", "interrupted", "blocked"}):
+            raise MonitorError("invalid task cursor state")
+    elif kind == "boss":
+        if (keys != {"status", "overdue_stage", "verb", "objective", "pr", "head"} or
+                not enum(state["status"], {"pending", "acknowledged"}) or
+                type(state["overdue_stage"]) is not int or state["overdue_stage"] < 0 or
+                not isinstance(state["verb"], str) or not TOKEN.fullmatch(state["verb"]) or
+                not isinstance(state["objective"], str) or not LABEL.fullmatch(state["objective"]) or
+                (state["pr"] is not None and (type(state["pr"]) is not int or state["pr"] < 1)) or
+                (state["head"] is not None and (not isinstance(state["head"], str) or not SHA.fullmatch(state["head"])))):
+            raise MonitorError("invalid boss cursor state")
+    elif kind == "supervisor":
+        if (keys != {"status", "overdue_stage", "kind", "pr", "head"} or
+                not enum(state["status"], {"OPEN", "ACKED"}) or
+                type(state["overdue_stage"]) is not int or state["overdue_stage"] < 0 or
+                not isinstance(state["kind"], str) or not TOKEN.fullmatch(state["kind"]) or
+                type(state["pr"]) is not int or state["pr"] < 1 or
+                not isinstance(state["head"], str) or not SHA.fullmatch(state["head"])):
+            raise MonitorError("invalid supervisor cursor state")
+    elif keys != {"satisfied"} or type(state["satisfied"]) is not bool:
+        raise MonitorError("invalid dependency cursor state")
+
+
+def validate_baseline(current, state_dir):
+    if not isinstance(current, dict) or set(current) != {"counts", "ids", "snapshot", "reconcile_only"}:
+        raise MonitorError("invalid baseline cursor event")
+    counts = current["counts"]
+    kinds = {"boss", "supervisor", "human_gates", "dependency_gates"}
+    if (not isinstance(counts, dict) or set(counts) != kinds or
+            any(type(value) is not int or value < 0 for value in counts.values()) or
+            not isinstance(current["ids"], list) or len(current["ids"]) > 100 or
+            any(type(entity) is not str for entity in current["ids"]) or
+            current["snapshot"] != str(state_dir / "learnrise-monitor-snapshot.json") or
+            current["reconcile_only"] is not True):
+        raise MonitorError("invalid baseline cursor event")
+    ids = current["ids"]
+    if ids != sorted(set(ids)):
+        raise MonitorError("invalid baseline IDs")
+    for entity in ids:
+        if entity_kind(entity) not in {"boss", "supervisor", "objective", "dependency"}:
+            raise MonitorError("invalid baseline entity")
+    observed = {"boss": sum(item.startswith("boss:") for item in ids),
+                "supervisor": sum(item.startswith("supervisor:") for item in ids),
+                "human_gates": sum(item.startswith("objective:") for item in ids),
+                "dependency_gates": sum(item.startswith("dependency:") for item in ids)}
+    if counts != observed:
+        raise MonitorError("invalid baseline counts")
+
+
+def validate_cursor(cursor, state_dir):
+    if (type(cursor.get("version")) is not int or cursor["version"] != 1 or
+            type(cursor.get("initialized")) is not bool or
+            not isinstance(cursor.get("entities"), dict) or len(cursor["entities"]) > 20_000 or
+            not isinstance(cursor.get("pending"), list) or len(cursor["pending"]) > 10_000):
+        raise MonitorError("invalid cursor")
+    for entity, record in cursor["entities"].items():
+        entity_kind(entity)
+        if (not isinstance(record, dict) or set(record) != {"state", "generation"} or
+                type(record.get("generation")) is not int or record["generation"] < 0):
+            raise MonitorError("invalid cursor entity state")
+        validate_semantic_state(entity, record["state"])
+    pending_ids = set()
+    last_transition = {}
+    baseline_count = 0
+    for position, event in enumerate(cursor["pending"]):
+        if (not isinstance(event, dict) or
+                set(event) not in ({"id", "entity", "previous", "current", "generation"},
+                                   {"id", "entity", "previous", "current", "generation", "silent"}) or
+                type(event["id"]) is not str or not re.fullmatch(r"[0-9a-f]{32}", event["id"]) or
+                type(event["generation"]) is not int or event["generation"] < 1 or
+                not isinstance(event["entity"], str)):
+            raise MonitorError("invalid pending cursor event")
+        silent = "silent" in event
+        if silent and event["silent"] is not True:
+            raise MonitorError("invalid silent transition")
+        if event["id"] in pending_ids:
+            raise MonitorError("duplicate pending event ID")
+        pending_ids.add(event["id"])
+        if event["entity"] == "baseline":
+            if silent:
+                raise MonitorError("invalid silent baseline")
+            baseline_count += 1
+            if cursor["initialized"] or position != 0 or baseline_count != 1 or event["generation"] != 1 or event["previous"] is not None:
+                raise MonitorError("invalid pending baseline")
+            validate_baseline(event["current"], state_dir)
+        else:
+            validate_semantic_state(event["entity"], event["previous"])
+            validate_semantic_state(event["entity"], event["current"])
+            if (event["previous"] == event["current"] or
+                    silent == meaningful(event["entity"], event["previous"], event["current"]) or
+                    event["entity"] not in cursor["entities"] or
+                    event["generation"] > cursor["entities"][event["entity"]]["generation"]):
+                raise MonitorError("invalid pending transition")
+            preceding = last_transition.get(event["entity"])
+            if silent and preceding is None and event["generation"] == 1:
+                raise MonitorError("orphan silent transition")
+            if preceding and (event["generation"] != preceding["generation"] + 1 or
+                              event["previous"] != preceding["current"]):
+                raise MonitorError("broken pending transition chain")
+            last_transition[event["entity"]] = event
+        if event["id"] != event_id(event["entity"], event["previous"], event["current"], event["generation"]):
+            raise MonitorError("invalid pending event identity")
+    if not cursor["initialized"] and cursor["pending"] and baseline_count != 1:
+        raise MonitorError("missing pending baseline")
+    for entity, last in last_transition.items():
+        stored = cursor["entities"][entity]
+        if last["generation"] != stored["generation"] or last["current"] != stored["state"]:
+            raise MonitorError("pending transition does not match cursor")
+
+
 def event_id(entity, before, after, generation):
     identity = [REPO, entity, before, after, generation, (after or {}).get("head")]
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:32]
@@ -237,7 +400,7 @@ def meaningful(entity, before, after):
     if entity.startswith("task:") and before is None:
         return False
     if entity.startswith("objective:") and before is None:
-        return False
+        return isinstance(after, dict) and after.get("state") == "OPEN" and after.get("gate") is True
     if entity.startswith("pr:") and before is None:
         return True
     return True
@@ -255,9 +418,10 @@ def message(event):
 
 def deliver(cursor, hub, cursor_path):
     for event in cursor["pending"][:]:
-        queued = bounded_run(["codex", "queue", "--thread", hub, "--message", message(event)], timeout=30)
-        if queued.returncode:
-            raise MonitorError("hub queue failed")
+        if "silent" not in event:
+            queued = bounded_run(["codex", "queue", "--thread", hub, "--message", message(event)], timeout=30)
+            if queued.returncode:
+                raise MonitorError("hub queue failed")
         cursor["pending"].remove(event)
         if event["entity"] == "baseline":
             cursor["initialized"] = True
@@ -300,10 +464,11 @@ def run(args):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise MonitorError("monitor overlap") from exc
-        cursor = read_json(cursor_path, optional=True) or {"version": 1, "initialized": False, "entities": {}, "pending": []}
-        if cursor.get("version") != 1 or not isinstance(cursor.get("entities"), dict) or not isinstance(cursor.get("pending"), list):
-            raise MonitorError("invalid cursor")
         try:
+            cursor = read_json(cursor_path, optional=True)
+            if cursor is None:
+                cursor = {"version": 1, "initialized": False, "entities": {}, "pending": []}
+            validate_cursor(cursor, args.state_dir)
             bridge = bounded_run([sys.executable, str(args.bridge), "--ledger", str(args.ledger), "--audit", str(args.audit), "--outbox", str(args.outbox), "--tasks", str(args.tasks)], timeout=240)
             if bridge.returncode not in (0, 3) or len(bridge.stdout) > MAX_BYTES:
                 raise MonitorError(f"bridge failed ({bridge.returncode})")
@@ -329,7 +494,8 @@ def run(args):
                 unresolved = sorted(k for k in snapshot if k.startswith(("boss:", "supervisor:")) or (k.startswith("objective:") and snapshot[k].get("gate")) or (k.startswith("dependency:") and not snapshot[k]["satisfied"]))
                 if len(unresolved) > 100:
                     raise MonitorError("baseline contains too many unresolved IDs for one bounded message")
-                baseline = {"id": event_id("baseline", None, {"ids": unresolved}, 1), "entity": "baseline", "previous": None, "current": {"counts": {"boss": sum(k.startswith("boss:") for k in unresolved), "supervisor": sum(k.startswith("supervisor:") for k in unresolved), "human_gates": sum(k.startswith("objective:") for k in unresolved), "dependency_gates": sum(k.startswith("dependency:") for k in unresolved)}, "ids": unresolved, "snapshot": str(args.state_dir / "learnrise-monitor-snapshot.json"), "reconcile_only": True}}
+                baseline_current = {"counts": {"boss": sum(k.startswith("boss:") for k in unresolved), "supervisor": sum(k.startswith("supervisor:") for k in unresolved), "human_gates": sum(k.startswith("objective:") for k in unresolved), "dependency_gates": sum(k.startswith("dependency:") for k in unresolved)}, "ids": unresolved, "snapshot": str(args.state_dir / "learnrise-monitor-snapshot.json"), "reconcile_only": True}
+                baseline = {"id": event_id("baseline", None, baseline_current, 1), "entity": "baseline", "previous": None, "current": baseline_current, "generation": 1}
                 cursor["pending"].append(baseline)
             if first_baseline:
                 # Freeze the source state covered by the baseline. A later scan
@@ -339,14 +505,21 @@ def run(args):
             # Record transitions from every fresh scan before retrying the
             # baseline. If the baseline queue fails again, later observations
             # are already durable behind it in pending delivery order.
+            pending_entities = {event["entity"] for event in cursor["pending"]}
             for entity in sorted(set(cursor["entities"]) | set(snapshot)):
                 prior = cursor["entities"].get(entity, {"state": None, "generation": 0})
                 current = snapshot.get(entity)
                 if current == prior["state"]:
                     continue
                 generation = prior["generation"] + 1
-                if meaningful(entity, prior["state"], current):
-                    cursor["pending"].append({"id": event_id(entity, prior["state"], current, generation), "entity": entity, "previous": prior["state"], "current": current})
+                should_queue = meaningful(entity, prior["state"], current)
+                if should_queue or entity in pending_entities:
+                    event = {"id": event_id(entity, prior["state"], current, generation), "entity": entity,
+                             "previous": prior["state"], "current": current, "generation": generation}
+                    if not should_queue:
+                        event["silent"] = True
+                    cursor["pending"].append(event)
+                    pending_entities.add(entity)
                 # Retain tombstones so a later red→green→red cycle cannot reuse
                 # a prior generation or event ID on the same PR head.
                 cursor["entities"][entity] = {"state": current, "generation": generation}
@@ -357,7 +530,7 @@ def run(args):
                 fault_path.unlink()
             print(json.dumps({"mode": "apply", "entities": len(snapshot), "pending": len(cursor["pending"])}))
             return 0
-        except (MonitorError, OSError, ValueError, json.JSONDecodeError) as exc:
+        except (MonitorError, OSError, ValueError, TypeError, KeyError, RecursionError, json.JSONDecodeError) as exc:
             atomic(fault_path, {"as_of": now.isoformat(), "error": str(exc)[:300]})
             raise
 
@@ -383,7 +556,7 @@ def main(argv=None):
         args.dry_run = True
     try:
         return run(args)
-    except (MonitorError, OSError, ValueError, json.JSONDecodeError) as exc:
+    except (MonitorError, OSError, ValueError, TypeError, KeyError, RecursionError, json.JSONDecodeError) as exc:
         print(f"learnrise monitor: {exc}", file=sys.stderr)
         return 2
 
