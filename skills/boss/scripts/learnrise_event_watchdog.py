@@ -28,6 +28,20 @@ def check(state_dir, hub, max_age=35, now=None, queue=None, notify=None):
             receipt = read_json(state_dir / "learnrise-monitor-receipt.json", optional=True)
         except (MonitorError, OSError, ValueError):
             receipt, receipt_invalid = None, True
+        mode_error = None
+        expected_mode = None
+        mode_path = state_dir / "learnrise-monitor-mode"
+        try:
+            if not mode_path.exists():
+                mode_error = "monitor activation mode missing"
+            elif mode_path.stat().st_size > 16:
+                mode_error = "monitor activation mode malformed"
+            else:
+                expected_mode = mode_path.read_text().strip()
+                if expected_mode not in {"shadow", "apply"}:
+                    mode_error = "monitor activation mode malformed"
+        except OSError:
+            mode_error = "monitor activation mode unreadable"
         fault_invalid = False
         try:
             monitor_fault = read_json(state_dir / "learnrise-monitor-fault.json", optional=True)
@@ -57,6 +71,10 @@ def check(state_dir, hub, max_age=35, now=None, queue=None, notify=None):
             reason = "monitor scan fault"
         if alert_invalid:
             reason = "watchdog alert state malformed"
+        if reason is None and mode_error:
+            reason = mode_error
+        if reason is None and receipt is not None and receipt.get("mode") != expected_mode:
+            reason = "monitor receipt mode mismatch"
         if reason is None:
             if alert_path.exists():
                 alert_path.unlink()

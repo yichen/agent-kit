@@ -34,7 +34,8 @@ class InstallerTests(unittest.TestCase):
             loaded.mkdir()
             fail_bootstrap = root / "fail-bootstrap"
             bad_plist = root / "bad-plist"
-            env = {**os.environ, "PATH": str(bin_dir) + ":" + os.environ["PATH"], "FAKE_LOADED": str(loaded),
+            # A clean macOS runner has no ripgrep; keep only system tools and fixtures.
+            env = {**os.environ, "PATH": str(bin_dir) + ":/usr/bin:/bin", "FAKE_LOADED": str(loaded),
                    "FAKE_FAIL_BOOTSTRAP": str(fail_bootstrap), "FAKE_BAD_PLIST": str(bad_plist),
                    "LEARNRISE_MONITOR_HOME": str(home), "LEARNRISE_MONITOR_SKILL_PATH": str(skill),
                    "LEARNRISE_MONITOR_STATE_DIR": str(state)}
@@ -42,8 +43,14 @@ class InstallerTests(unittest.TestCase):
                 return subprocess.run(["bash", str(SCRIPT), mode], env=env, capture_output=True, text=True)
             self.assertEqual(call("install").returncode, 0)
             plist = home / "Library/LaunchAgents/com.yichen.boss.learnrise.event-monitor.plist"
+            mode_file = state / "learnrise-monitor-mode"
+            self.assertEqual(mode_file.read_text().strip(), "shadow")
             self.assertIn("--shadow", plist.read_text())
-            self.assertEqual(call("check").returncode, 0)
+            checked = call("check")
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            mode_file.write_text("apply\n")
+            self.assertNotEqual(call("check").returncode, 0)
+            mode_file.write_text("shadow\n")
             original = plist.read_text()
             plist.write_text(original.replace("<integer>900</integer>", "<integer>901</integer>"))
             self.assertNotEqual(call("check").returncode, 0)
@@ -62,10 +69,15 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(plist.read_text(), original)
             self.assertEqual(call("check").returncode, 0)
             self.assertEqual(call("activate").returncode, 0)
+            self.assertEqual(mode_file.read_text().strip(), "apply")
             self.assertIn("--apply", plist.read_text())
             self.assertEqual(call("check").returncode, 0)
+            mode_file.write_text("shadow\n")
+            self.assertNotEqual(call("check").returncode, 0)
+            mode_file.write_text("apply\n")
             self.assertEqual(call("stop").returncode, 0)
             self.assertFalse(plist.exists())
+            self.assertFalse(mode_file.exists())
             self.assertEqual(unrelated.read_text(), "leave me alone")
 
 

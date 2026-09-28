@@ -146,6 +146,7 @@ def validate_sources(ledger, outbox, supervisor, inventory, hub, now):
             raise MonitorError("invalid or duplicate dependency gate")
         gate_ids.add(gate["id"])
     ids = set()
+    linked_open_prs = set()
     for row in rows:
         if not isinstance(row, dict) or not LABEL.fullmatch(str(row.get("id", ""))) or row["id"] in ids or (row.get("github_state") not in {"OPEN", "CLOSED"} and not (row.get("issue_number") is None and row.get("status") == "COMPLETED")):
             raise MonitorError("invalid objective")
@@ -160,6 +161,8 @@ def validate_sources(ledger, outbox, supervisor, inventory, hub, now):
             pr_state = (row.get("pull_request_states") or {}).get(str(number))
             if pr_state not in {None, "OPEN", "MERGED", "CLOSED"}:
                 raise MonitorError("invalid linked PR state")
+            if pr_state == "OPEN":
+                linked_open_prs.add(number)
             head = ((row.get("pr_observations") or {}).get(str(number)) or {}).get("head")
             if head is not None and not SHA.fullmatch(str(head)):
                 raise MonitorError("invalid linked PR head")
@@ -181,6 +184,8 @@ def validate_sources(ledger, outbox, supervisor, inventory, hub, now):
             if not isinstance(check, dict) or not isinstance(check.get("name"), str) or not 1 <= len(check["name"]) <= 120 or any(ord(char) < 32 for char in check["name"]) or check.get("state") not in {"SUCCESS", "PENDING", "FAILURE"}:
                 raise MonitorError("invalid PR check")
         numbers.add(pr["number"])
+    if linked_open_prs - numbers:
+        raise MonitorError("open linked PR missing from full inventory")
 
 
 def semantic(ledger, outbox, supervisor, inventory, now):

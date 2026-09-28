@@ -100,6 +100,39 @@ class MonitorTests(unittest.TestCase):
                 with self.assertRaises(monitor.MonitorError):
                     monitor.validate_sources(*args, now)
 
+    def test_open_linked_prs_require_full_open_inventory(self):
+        now = monitor.now_utc()
+        def pr(number):
+            return {"number": number, "head": "a" * 40, "merge": "CLEAN",
+                    "observation": {"checks": [], "review": {"state": "APPROVED"}}}
+        row = {"id": "#1", "github_state": "OPEN", "pull_requests": [7],
+               "pull_request_states": {"7": "OPEN"}}
+        base = {"schema_version": 1, "repository": monitor.REPO,
+                "last_checked_utc": now.isoformat(), "objectives": [row],
+                "open_pull_requests": [pr(7)], "dependency_gates": []}
+        outbox = {"version": 1, "actions": {}}
+        supervisor = {"schema_version": 1, "repository": monitor.REPO,
+                      "last_scan_utc": now.isoformat(), "actions": {}}
+        inventory = {"as_of": now.isoformat(), "tasks": []}
+        cases = [
+            ("complete", [7], {"7": "OPEN"}, [7], True),
+            ("empty_inventory", [7], {"7": "OPEN"}, [], False),
+            ("wrong_pr_only", [7], {"7": "OPEN"}, [8], False),
+            ("truncated_inventory", [7, 8], {"7": "OPEN", "8": "OPEN"}, [7], False),
+            ("merged_pr_absent", [7], {"7": "MERGED"}, [], True),
+            ("closed_pr_absent", [7], {"7": "CLOSED"}, [], True),
+        ]
+        for name, linked, states, open_numbers, valid in cases:
+            with self.subTest(name=name):
+                ledger = {**base, "objectives": [{**row, "pull_requests": linked,
+                                                   "pull_request_states": states}],
+                          "open_pull_requests": [pr(number) for number in open_numbers]}
+                if valid:
+                    monitor.validate_sources(ledger, outbox, supervisor, inventory, HUB, now)
+                else:
+                    with self.assertRaisesRegex(monitor.MonitorError, "open linked PR missing"):
+                        monitor.validate_sources(ledger, outbox, supervisor, inventory, HUB, now)
+
     def test_generation_distinguishes_red_green_red_and_retry(self):
         red = {"head": "a" * 40, "failed_checks": ["build"]}
         green = {"head": "a" * 40, "failed_checks": []}
@@ -325,6 +358,7 @@ class MonitorTests(unittest.TestCase):
     def test_queue_timeout_does_not_clear_watchdog_outage_during_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
+            (path / "learnrise-monitor-mode").write_text("apply\n")
             now = monitor.now_utc()
             report = self.fixture(path, now)
             args = ["--apply", "--state-dir", str(path),
@@ -398,8 +432,9 @@ class MonitorTests(unittest.TestCase):
     def test_watchdog_stopped_monitor_queue_retry_recovery(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
+            (path / "learnrise-monitor-mode").write_text("shadow\n")
             now = datetime(2026, 9, 28, tzinfo=UTC)
-            monitor.atomic(path / "learnrise-monitor-receipt.json", {"as_of": (now - timedelta(minutes=36)).isoformat()})
+            monitor.atomic(path / "learnrise-monitor-receipt.json", {"as_of": (now - timedelta(minutes=36)).isoformat(), "mode": "shadow"})
             calls = []
             def failed(argv):
                 calls.append(argv)
@@ -412,9 +447,39 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(watchdog.check(path, HUB, now=now + timedelta(minutes=1), queue=lambda argv: calls.append(argv) or Result()), 2)
             self.assertEqual(json.loads(calls[0][-1])["event_id"], json.loads(calls[1][-1])["event_id"])
             self.assertEqual(len(calls), 2)
-            monitor.atomic(path / "learnrise-monitor-receipt.json", {"as_of": (now + timedelta(minutes=2)).isoformat()})
+            monitor.atomic(path / "learnrise-monitor-receipt.json", {"as_of": (now + timedelta(minutes=2)).isoformat(), "mode": "shadow"})
             self.assertEqual(watchdog.check(path, HUB, now=now + timedelta(minutes=2), queue=failed), 0)
             self.assertFalse((path / "learnrise-watchdog-alert.json").exists())
+
+    def test_watchdog_mode_matches_installed_activation_table(self):
+        now = datetime(2026, 9, 28, tzinfo=UTC)
+        cases = [
+            ("shadow_before_cutover", "shadow", "shadow", True, None),
+            ("apply_after_cutover", "apply", "apply", True, None),
+            ("shadow_receipt_after_activation", "apply", "shadow", False, "monitor receipt mode mismatch"),
+            ("apply_receipt_in_shadow", "shadow", "apply", False, "monitor receipt mode mismatch"),
+            ("invalid_mode_marker", "invalid", "shadow", False, "monitor activation mode malformed"),
+            ("missing_mode_marker", None, "shadow", False, "monitor activation mode missing"),
+        ]
+        for name, expected_mode, receipt_mode, healthy, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                if expected_mode is not None:
+                    (path / "learnrise-monitor-mode").write_text(expected_mode + "\n")
+                monitor.atomic(path / "learnrise-monitor-receipt.json",
+                               {"as_of": now.isoformat(), "mode": receipt_mode})
+                queued = []
+                result = watchdog.check(path, HUB, now=now,
+                                        queue=lambda argv: queued.append(json.loads(argv[-1])) or Result())
+                if healthy:
+                    self.assertEqual(result, 0)
+                    self.assertEqual(queued, [])
+                    self.assertFalse((path / "learnrise-watchdog-alert.json").exists())
+                else:
+                    self.assertEqual(result, 2)
+                    self.assertEqual(len(queued), 1)
+                    self.assertEqual(queued[0]["reason"], reason)
+                    self.assertEqual(monitor.read_json(path / "learnrise-watchdog-alert.json")["reason"], reason)
 
     def test_watchdog_missing_corrupt_truncated_receipts_are_durable_outages(self):
         now = datetime(2026, 9, 28, tzinfo=UTC)
@@ -428,6 +493,7 @@ class MonitorTests(unittest.TestCase):
         for name, contents, expected_reason in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp)
+                (path / "learnrise-monitor-mode").write_text("shadow\n")
                 receipt = path / "learnrise-monitor-receipt.json"
                 if contents is not None:
                     receipt.write_text(contents)
@@ -446,7 +512,7 @@ class MonitorTests(unittest.TestCase):
                 self.assertEqual(watchdog.check(path, HUB, now=now + timedelta(minutes=1),
                                                 queue=lambda argv: queued.append(json.loads(argv[-1])) or Result()), 2)
                 self.assertEqual(queued[0]["event_id"], queued[1]["event_id"])
-                monitor.atomic(receipt, {"as_of": (now + timedelta(minutes=2)).isoformat()})
+                monitor.atomic(receipt, {"as_of": (now + timedelta(minutes=2)).isoformat(), "mode": "shadow"})
                 self.assertEqual(watchdog.check(path, HUB, now=now + timedelta(minutes=2),
                                                 queue=failed), 0)
                 self.assertFalse((path / "learnrise-watchdog-alert.json").exists())

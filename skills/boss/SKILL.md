@@ -252,6 +252,9 @@ the coverage, queue canary, and stopped-monitor watchdog canary before pausing
 covered heartbeats. Then run `scripts/install-learnrise-monitor.sh activate`
 and the first `--apply`, verify the baseline receipt, and observe an unchanged
 cycle. `scripts/install-learnrise-monitor.sh check` validates the two jobs.
+The installer records `learnrise-monitor-mode` under the host artifact root;
+`check` verifies it against the loaded plist, and the watchdog treats a fresh
+shadow receipt after activation as a fault until an apply run succeeds.
 On cutover failure, restore the paused heartbeats and run
 `scripts/install-learnrise-monitor.sh stop`; it unloads only these new jobs.
 The watchdog retries one stable fault event per outage and also leaves a local
