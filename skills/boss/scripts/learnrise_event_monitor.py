@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 UTC = timezone.utc
 REPO = "yichen/LearnRise"
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+AUTOMATION_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,127}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 ACTION = re.compile(r"[0-9a-f]{20,64}\Z")
 LABEL = re.compile(r"[A-Za-z0-9# _-]{1,80}\Z")
@@ -499,7 +500,7 @@ def validate_cutover_ready(state_dir, hub, now):
     coverage, drain, shadow = ready["coverage"], ready["drain"], ready["shadow"]
     covered, paused, objectives = (coverage["covered_heartbeat_ids"],
                                    coverage["paused_heartbeat_ids"], coverage["objectives"])
-    if (not isinstance(covered, list) or not covered or any(type(v) is not str or not UUID.fullmatch(v) for v in covered) or
+    if (not isinstance(covered, list) or not covered or any(type(v) is not str or not AUTOMATION_ID.fullmatch(v) for v in covered) or
             not isinstance(paused, list) or sorted(paused) != sorted(covered) or len(set(covered)) != len(covered) or
             not isinstance(objectives, list) or not objectives or
             any(type(v) is not str or not LABEL.fullmatch(v) for v in objectives) or len(set(objectives)) != len(objectives) or
