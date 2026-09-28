@@ -725,6 +725,10 @@ def run(args):
             report = json.loads(bridge.stdout)
             if not isinstance(report, dict) or not isinstance(report.get("actions"), list) or not isinstance(report.get("overdue"), list):
                 raise MonitorError("malformed bridge report")
+            # The live bridge can spend minutes auditing GitHub. Validate its
+            # newly written timestamps against the time it finished, not the
+            # time this monitor started.
+            now = now_utc()
             ledger = read_json(args.observed)
             outbox = read_json(args.outbox)
             supervisor = read_json(args.supervisor)
