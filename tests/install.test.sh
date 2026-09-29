@@ -45,6 +45,8 @@ test "$(readlink "$TEST_HOME/.codex/skills/q")" = "$TEST_HOME/.agents/skills/q"
 test "$(readlink "$TEST_HOME/.codex/skills/qwen-delegate")" = "$TEST_HOME/.agents/skills/qwen-delegate"
 test "$(readlink "$TEST_HOME/.claude/skills/qwen-delegate")" = "$TEST_HOME/.agents/skills/qwen-delegate"
 test "$(readlink "$TEST_HOME/.pi/agent/skills/qwen-delegate")" = "$TEST_HOME/.agents/skills/qwen-delegate"
+test -L "$TEST_HOME/.pi/agent/extensions/orchestrator"
+test "$(readlink "$TEST_HOME/.pi/agent/extensions/orchestrator")" = "$ROOT/extensions/orchestrator"
 grep -Fq "$TEST_HOME/.agents/skills/qwen-delegate/scripts/ollama-delegate.sh" "$TEST_HOME/Library/LaunchAgents/com.yichen.sharedanchor-ollama-delegate-warm.plist"
 grep -Fq "$TEST_HOME/.agents/skills/qwen-delegate/scripts/qwen-delegate-report.sh" "$TEST_HOME/Library/LaunchAgents/com.yichen.sharedanchor-ollama-delegate-report.plist"
 
@@ -72,6 +74,17 @@ test "$wrong_codex_status" -eq 2
 test "$(readlink "$TEST_HOME/.codex/skills/q")" = "$TEST_ROOT/wrong-target"
 rm "$TEST_HOME/.codex/skills/q"
 ln -s "$TEST_HOME/.agents/skills/q" "$TEST_HOME/.codex/skills/q"
+
+rm "$TEST_HOME/.pi/agent/extensions/orchestrator"
+ln -s "$TEST_ROOT/wrong-target" "$TEST_HOME/.pi/agent/extensions/orchestrator"
+set +e
+"$INSTALLER" install > "$TEST_ROOT/wrong-ext.out" 2> "$TEST_ROOT/wrong-ext.err"
+wrong_ext_status=$?
+set -e
+test "$wrong_ext_status" -eq 2
+test "$(readlink "$TEST_HOME/.pi/agent/extensions/orchestrator")" = "$TEST_ROOT/wrong-target"
+rm "$TEST_HOME/.pi/agent/extensions/orchestrator"
+ln -s "$ROOT/extensions/orchestrator" "$TEST_HOME/.pi/agent/extensions/orchestrator"
 
 printf '\n# drift\n' >> "$TEST_HOME/Library/LaunchAgents/com.yichen.sharedanchor-ollama-delegate-warm.plist"
 set +e

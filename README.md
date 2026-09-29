@@ -60,3 +60,49 @@ The measured worst case on this host ran 39 revisions and 67 review dispatches o
 
 Delegates a `$q` prompt to a subagent and returns its answer in the calling Codex task.
 It does not post a dispatch notice or save the answer to a separate file.
+
+## Extensions
+
+Pi extensions live in `extensions/<name>/` and install as a symlink from
+`$HOME/.pi/agent/extensions/<name>` to this checkout, so a checkout
+fast-forward after merge updates every future pi session with no extra steps.
+`install.sh check` verifies the link; the first link creation needs one
+`./install.sh install` run.
+
+### orchestrator
+
+A long-running pi session that babysits worker coding agents in herdr panes.
+It launches one local-model pi worker at a time (`maxWorkers`, default 1),
+runs a mechanical watcher, and wakes the orchestrator conversation only on
+judgment events. The worker driver, launch gate, stall detection, CI round
+cap, dialog allowlist, and wake batching are pure functions in
+`extensions/orchestrator/lib.mjs` with table-driven no-token tests; every
+herdr/gh/filesystem effect lives in `extensions/orchestrator/executor.mjs`.
+
+Tier 1 (extension, no model tokens): templated CI-failure nudges up to
+`ciMaxRounds` (default 5), resume nudges, escape on stalls, allowlisted
+dialog auto-answers, pane close after merge.
+Tier 2 (wakes the orchestrator session): unknown blocked dialogs (fail
+closed — the default allowlist is empty), CI rounds exhausted, merge
+timeout, persistent stall, worker lost, cycle done (triage next ticket).
+Tier 3 (escalate to the human): the orchestrator session decides; prod
+data, consent/child-data, and legal boundaries are never auto-answered.
+
+Configuration is per consuming repo in `.pi/orchestrator.json` (all keys
+optional except none — defaults encode maxWorkers 1, pi on
+`ollama/qwen3.8:27b-mlx-128k`, 15-minute stall window, 5 CI rounds, empty
+dialog allowlist). Unknown keys, malformed values, or an invalid regex
+disable the watcher instead of guessing. State persists outside any repo at
+`${AGENTS_ARTIFACTS_ROOT:-$HOME/agents-artifacts}/orchestrator/state.json`
+and is reconciled against live herdr truth every tick; herdr is the source
+of truth and pane IDs are never reused, so stale records are always
+detectable.
+
+Run the no-token tests and the opt-in live canary (real herdr panes, real
+pi worker on ollama, stubbed `gh`; creates and closes its own panes and
+fails if any survive):
+
+```bash
+node --test extensions/orchestrator/tests/orchestrator-lib.test.mjs
+AGENT_KIT_ORCH_CANARY=1 bash extensions/orchestrator/tests/orchestrator-canary.test.sh
+```
