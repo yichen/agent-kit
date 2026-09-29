@@ -9,6 +9,7 @@ PRIMARY_ROOT="${AGENT_KIT_PRIMARY_SKILLS_ROOT:-$USER_HOME/.agents/skills}"
 CODEX_ROOT="${AGENT_KIT_CODEX_SKILLS_ROOT:-$USER_HOME/.codex/skills}"
 CLAUDE_ROOT="${AGENT_KIT_CLAUDE_SKILLS_ROOT:-$USER_HOME/.claude/skills}"
 PI_ROOT="${AGENT_KIT_PI_SKILLS_ROOT:-$USER_HOME/.pi/agent/skills}"
+PI_EXTENSIONS_ROOT="${AGENT_KIT_PI_EXTENSIONS_ROOT:-$USER_HOME/.pi/agent/extensions}"
 BACKUP_ROOT="${AGENT_KIT_BACKUP_ROOT:-$USER_HOME/.agent-kit/backups}"
 MODE="${1:-}"
 ADOPT=0
@@ -37,6 +38,20 @@ for skill_dir in "$REPO_ROOT"/skills/*; do
   skill_directories+=("$skill_dir")
 done
 [ "${#skill_directories[@]}" -gt 0 ] || { echo "agent-kit: no skills found" >&2; exit 2; }
+
+extension_directories=()
+if [ -d "$REPO_ROOT/extensions" ]; then
+  for extension_dir in "$REPO_ROOT"/extensions/*; do
+    [ -d "$extension_dir" ] || continue
+    [ -f "$extension_dir/index.ts" ] || { echo "agent-kit: missing index.ts in $extension_dir" >&2; exit 2; }
+    extension_name="$(basename "$extension_dir")"
+    [[ "$extension_name" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || {
+      echo "agent-kit: invalid extension directory name: $extension_name" >&2
+      exit 2
+    }
+    extension_directories+=("$extension_dir")
+  done
+fi
 
 expected_link() {
   local target="$1" expected="$2"
@@ -84,6 +99,11 @@ for skill_dir in "${skill_directories[@]}"; do
   preflight_target "$PI_ROOT/$skill_name" "$primary"
 done
 
+for extension_dir in ${extension_directories[@]+"${extension_directories[@]}"}; do
+  extension_name="$(basename "$extension_dir")"
+  preflight_target "$PI_EXTENSIONS_ROOT/$extension_name" "$extension_dir"
+done
+
 if [ "$MODE" = "check" ]; then
   for skill_dir in "${skill_directories[@]}"; do
     skill_name="$(basename "$skill_dir")"
@@ -96,11 +116,18 @@ if [ "$MODE" = "check" ]; then
       AGENT_KIT_USER_HOME="$USER_HOME" AGENT_KIT_PRIMARY_SKILL_PATH="$primary" "$skill_dir/scripts/install-host-service.sh" check
     fi
   done
+  for extension_dir in ${extension_directories[@]+"${extension_directories[@]}"}; do
+    extension_name="$(basename "$extension_dir")"
+    expected_link "$PI_EXTENSIONS_ROOT/$extension_name" "$extension_dir" || {
+      echo "agent-kit: Pi extension link mismatch: $PI_EXTENSIONS_ROOT/$extension_name" >&2
+      exit 2
+    }
+  done
   echo "agent-kit: links and host services are synchronized"
   exit 0
 fi
 
-mkdir -p "$PRIMARY_ROOT" "$CODEX_ROOT" "$CLAUDE_ROOT" "$PI_ROOT"
+mkdir -p "$PRIMARY_ROOT" "$CODEX_ROOT" "$CLAUDE_ROOT" "$PI_ROOT" "${PI_EXTENSIONS_ROOT:-$USER_HOME/.pi/agent/extensions}"
 for skill_dir in "${skill_directories[@]}"; do
   skill_name="$(basename "$skill_dir")"
   primary="$PRIMARY_ROOT/$skill_name"
@@ -111,5 +138,9 @@ for skill_dir in "${skill_directories[@]}"; do
   if [ -x "$skill_dir/scripts/install-host-service.sh" ]; then
     AGENT_KIT_USER_HOME="$USER_HOME" AGENT_KIT_PRIMARY_SKILL_PATH="$primary" "$skill_dir/scripts/install-host-service.sh" install
   fi
+done
+for extension_dir in ${extension_directories[@]+"${extension_directories[@]}"}; do
+  extension_name="$(basename "$extension_dir")"
+  backup_and_link "$PI_EXTENSIONS_ROOT/$extension_name" "$extension_dir" pi-extensions
 done
 "$0" check
