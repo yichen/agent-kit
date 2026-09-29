@@ -80,14 +80,16 @@ cap, dialog allowlist, and wake batching are pure functions in
 herdr/gh/filesystem effect lives in `extensions/orchestrator/executor.mjs`.
 
 Tier 1 (extension, no model tokens): templated CI-failure nudges up to
-`ciMaxRounds` (default 5), resume nudges, escape on stalls, allowlisted
-dialog auto-answers, pane close after merge, and fast abort recovery — a
+`ciMaxRounds` (default 5), resume nudges, allowlisted dialog auto-answers,
+pane close after merge, and fast abort recovery — a
 worker whose turn died ("Operation aborted") gets an immediate continue
 nudge (tail-anchored screen match, capped, then a `WORKER_ABORT_LOOP` wake).
 Tier 2 (wakes the orchestrator session): unknown blocked dialogs (fail
 closed — the default allowlist is empty), CI rounds exhausted, merge
 timeout, persistent stall, worker lost, abort loop, cycle done (triage next
-ticket).
+ticket). The watcher uses the worker session file's modification time to
+recognize progress within a long turn. After 15 minutes without observed
+progress, it reports a stall without interrupting the worker.
 Tier 3 (escalate to the human): the orchestrator session decides; prod
 data, consent/child-data, and legal boundaries are never auto-answered.
 

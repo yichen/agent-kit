@@ -4,7 +4,7 @@
 // runTick() here, so tests exercise the real command surface.
 
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir as osTmpdir } from "node:os";
 import { tick, isValidState, resolveWorkerCwd } from "./lib.mjs";
@@ -80,6 +80,18 @@ export async function repoSlug(cwd = process.cwd()) {
   return null;
 }
 
+// Read-only observation. A missing or unreadable session is unknown progress,
+// never evidence that an active turn should be interrupted.
+export function sessionActivityAt(sessionPath) {
+  if (typeof sessionPath !== "string" || !sessionPath) return null;
+  try {
+    const stat = statSync(sessionPath);
+    return stat.isFile() && Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : null;
+  } catch {
+    return null;
+  }
+}
+
 // Build the world snapshot for one tick from live herdr + gh state.
 export async function gatherWorld(config, state, cwd = process.cwd()) {
   const list = await herdrJson(["agent", "list"]);
@@ -117,7 +129,15 @@ export async function gatherWorld(config, state, cwd = process.cwd()) {
     : cwd;
   const slug = await repoSlug(firstCwd);
   const pr = first?.prNumber ? await gatherPrStatus(config, first.prNumber) : null;
-  return { liveAgents, paneScreen, pr, repoSlug: slug };
+  const agentsByName = new Map(allAgents.map((a) => [a.name, a]));
+  const sessionActivityByWorker = Object.fromEntries(state.workers.map((worker) => {
+    const agent = agentsByName.get(worker.name);
+    const sessionPath = agent?.agent_session?.kind === "path"
+      ? agent.agent_session.value
+      : worker.sessionPath;
+    return [worker.name, sessionActivityAt(sessionPath)];
+  }));
+  return { liveAgents, paneScreen, pr, repoSlug: slug, sessionActivityAt: sessionActivityByWorker };
 }
 
 // Apply one action decided by tick(). Only acts on names present in state.
@@ -184,7 +204,6 @@ export async function changeWorker(statePath, config, change, cwd = process.cwd(
     lastChangeSeq: start.json?.result?.agent?.state_change_seq ?? 0,
     lastStatus: "idle",
     phase: worker.prNumber ? "awaiting_review" : "working",
-    stallEscaped: false,
     stallReported: false,
     blockedReported: false,
     resumeNudged: false,

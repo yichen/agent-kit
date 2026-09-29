@@ -2,7 +2,7 @@
 // running in herdr panes. The pi session that loads this extension is the
 // Orchestrator: it triages tickets, launches one local-model worker at a time
 // (maxWorkers), and is woken ONLY on judgment events. Mechanical nudges
-// (CI rounds, resume, allowlisted dialogs, stall escape, close-after-merge)
+// (CI rounds, resume, allowlisted dialogs, stall reporting, close-after-merge)
 // run here without any model tokens.
 //
 // Pure decisions live in lib.mjs; all herdr/gh/fs effects live in

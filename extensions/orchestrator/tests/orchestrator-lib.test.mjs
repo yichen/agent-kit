@@ -4,6 +4,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { gatherWorld, sessionActivityAt } from "../executor.mjs";
 import {
   DEFAULT_CONFIG,
   ciNudgeText,
@@ -165,6 +169,69 @@ test("coalesceEvents: dedupes by code+worker, sorts tier3 first, caps", () => {
   assert.equal(merged.filter((e) => e.code === "CI_ROUNDS_EXHAUSTED").length, 1);
 });
 
+test("sessionActivityAt: read-only observation of valid and invalid sessions", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-session-stat-"));
+  try {
+    const path = join(dir, "worker.jsonl");
+    writeFileSync(path, '{"type":"message"}\n');
+    const before = statSync(path);
+    const entries = readdirSync(dir);
+    for (const [label, input, expected] of [
+      ["session file", path, before.mtimeMs],
+      ["missing file", join(dir, "missing.jsonl"), null],
+      ["directory", dir, null],
+      ["empty path", "", null],
+      ["malformed path", { path }, null],
+    ]) {
+      assert.equal(sessionActivityAt(input), expected, label);
+    }
+    assert.deepEqual(readdirSync(dir), entries, "observation must not create files");
+    assert.equal(readFileSync(path, "utf8"), '{"type":"message"}\n');
+    assert.equal(statSync(path).mtimeMs, before.mtimeMs, "observation must not write the transcript");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("gatherWorld: per-worker progress and session fallback without writes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-world-"));
+  const oldPath = process.env.PATH;
+  try {
+    const active = join(dir, "active.jsonl");
+    const stale = join(dir, "stale.jsonl");
+    const herdr = join(dir, "herdr");
+    const now = Date.now();
+    for (const [path, secondsAgo] of [[active, 1], [stale, 150]]) {
+      writeFileSync(path, '{"type":"message"}\n');
+      utimesSync(path, (now - secondsAgo * 1000) / 1000, (now - secondsAgo * 1000) / 1000);
+    }
+    const agents = { result: { agents: [
+      { name: "active", agent_status: "working", state_change_seq: 1, pane_id: "p1", cwd: dir, agent_session: { kind: "path", value: active } },
+      { name: "stale", agent_status: "working", state_change_seq: 1, pane_id: "p2", cwd: dir },
+      { name: "unmanaged", agent_status: "working", state_change_seq: 1, pane_id: "p3", cwd: dir, agent_session: { kind: "path", value: join(dir, "missing.jsonl") } },
+    ] } };
+    writeFileSync(herdr, `#!/bin/sh\nif [ "$1" = agent ] && [ "$2" = list ]; then printf '%s\\n' '${JSON.stringify(agents)}'; else printf '%s\\n' 'screen'; fi\n`);
+    chmodSync(herdr, 0o755);
+    process.env.PATH = `${dir}:${oldPath}`;
+    const before = [statSync(active).mtimeMs, statSync(stale).mtimeMs];
+    const entries = readdirSync(dir);
+    const state = initState(2);
+    state.workers.push(makeWorker({ name: "active", lastStatus: "working", lastActivityAt: now - 150_000 }));
+    state.workers.push(makeWorker({ name: "stale", lastStatus: "working", lastActivityAt: now - 150_000, sessionPath: stale }));
+    const world = await gatherWorld(baseConfig(), state, dir);
+    assert.deepEqual(world.sessionActivityAt, { active: before[0], stale: before[1] });
+    assert.deepEqual(world.liveAgents.map((a) => a.name), ["active", "stale"]);
+    const decision = tick(state, world, baseConfig({ stallSeconds: 100 }), now);
+    assert.deepEqual(decision.actions, []);
+    assert.deepEqual(decision.events.map((event) => event.worker), ["stale"]);
+    assert.deepEqual(readdirSync(dir), entries, "read-only world snapshot must not create files");
+    assert.deepEqual([statSync(active).mtimeMs, statSync(stale).mtimeMs], before);
+  } finally {
+    process.env.PATH = oldPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------- tick: lifecycle table ----------
 
 test("tick: pane gone without merge -> WORKER_LOST, archived", () => {
@@ -234,32 +301,66 @@ test("tick: fresh working state -> no actions", () => {
   assert.deepEqual(events, []);
 });
 
-test("tick: stall -> escape once, then STALL_PERSISTENT once", () => {
-  const S = 1000;
+test("tick: active transcript progress prevents false stall and Escape", () => {
   const config = baseConfig({ stallSeconds: 100 });
   const state = initState(1);
   state.workers.push(makeWorker({ lastStatus: "working" }));
-  const world = { liveAgents: [live("orch-worker-1", "working", "w1:p2", 1)], paneScreen: null, pr: null, repoSlug: "o/r" };
-  const first = tick(state, world, config, T0 + 150 * S);
-  assert.deepEqual(first.actions, [{ type: "send_keys", worker: "orch-worker-1", keys: ["escape"] }]);
-  const second = tick(first.state, world, config, T0 + 300 * S);
-  assert.deepEqual(second.actions, []);
-  assert.equal(second.events[0].code, "STALL_PERSISTENT");
-  const third = tick(second.state, world, config, T0 + 450 * S);
-  assert.deepEqual(third.actions, []);
-  assert.deepEqual(third.events, []);
+  const world = { liveAgents: [live("orch-worker-1", "working")], paneScreen: null, pr: null, repoSlug: "o/r", sessionActivityAt: { "orch-worker-1": T0 + 140_000 } };
+  const result = tick(state, world, config, T0 + 150_000);
+  assert.deepEqual(result.actions, []);
+  assert.deepEqual(result.events, []);
+  assert.equal(result.state.workers[0].lastActivityAt, T0 + 140_000);
 });
 
-test("tick: state change resets stall bookkeeping", () => {
-  const S = 1000;
+test("tick: stale working sessions are reported once without interrupting the turn", () => {
+  const config = baseConfig({ stallSeconds: 100 });
+  for (const [label, activity] of [
+    ["old transcript", T0 + 1_000],
+    ["unavailable transcript", null],
+    ["future transcript mtime", T0 + 500_000],
+    ["malformed transcript mtime", "150000"],
+  ]) {
+    const state = initState(1);
+    state.workers.push(makeWorker({ lastStatus: "working" }));
+    const world = { liveAgents: [live("orch-worker-1", "working")], paneScreen: null, pr: null, repoSlug: "o/r", sessionActivityAt: { "orch-worker-1": activity } };
+    const first = tick(state, world, config, T0 + 150_000);
+    assert.deepEqual(first.actions, [], label);
+    assert.equal(first.events[0]?.code, "STALL_PERSISTENT", label);
+    const second = tick(first.state, world, config, T0 + 300_000);
+    assert.deepEqual(second.actions, [], label);
+    assert.deepEqual(second.events, [], label);
+  }
+});
+
+test("tick: transcript activity or state change resets stall reporting", () => {
   const config = baseConfig({ stallSeconds: 100 });
   const state = initState(1);
   state.workers.push(makeWorker({ lastStatus: "working" }));
-  const stalled = tick(state, { liveAgents: [live("orch-worker-1", "working", "w1:p2", 1)], paneScreen: null, pr: null, repoSlug: "o/r" }, config, T0 + 150 * S);
-  const progressed = tick(stalled.state, { liveAgents: [live("orch-worker-1", "working", "w1:p2", 2)], paneScreen: null, pr: null, repoSlug: "o/r" }, config, T0 + 300 * S);
-  assert.deepEqual(progressed.actions, []);
-  const stalledAgain = tick(progressed.state, { liveAgents: [live("orch-worker-1", "working", "w1:p2", 2)], paneScreen: null, pr: null, repoSlug: "o/r" }, config, T0 + 500 * S);
-  assert.deepEqual(stalledAgain.actions, [{ type: "send_keys", worker: "orch-worker-1", keys: ["escape"] }]);
+  const world = { liveAgents: [live("orch-worker-1", "working")], paneScreen: null, pr: null, repoSlug: "o/r" };
+  const stalled = tick(state, world, config, T0 + 150_000);
+  const progressed = tick(stalled.state, { ...world, sessionActivityAt: { "orch-worker-1": T0 + 200_000 } }, config, T0 + 210_000);
+  assert.deepEqual(progressed.events, []);
+  const stalledAgain = tick(progressed.state, world, config, T0 + 350_000);
+  assert.equal(stalledAgain.events[0]?.code, "STALL_PERSISTENT");
+  assert.deepEqual(stalledAgain.actions, []);
+  const changed = tick(stalledAgain.state, { ...world, liveAgents: [live("orch-worker-1", "working", "w1:p2", 2)] }, config, T0 + 400_000);
+  assert.deepEqual(changed.events, []);
+});
+
+test("tick: each worker uses only its own transcript activity", () => {
+  const config = baseConfig({ stallSeconds: 100 });
+  const state = initState(2);
+  state.workers.push(makeWorker({ name: "active", lastStatus: "working" }));
+  state.workers.push(makeWorker({ name: "stale", lastStatus: "working" }));
+  const world = {
+    liveAgents: [live("active", "working"), live("stale", "working")],
+    sessionActivityAt: { active: T0 + 140_000, stale: T0 + 1_000 },
+  };
+  const first = tick(state, world, config, T0 + 150_000);
+  assert.deepEqual(first.actions, []);
+  assert.deepEqual(first.events.map((event) => event.worker), ["stale"]);
+  assert.equal(first.state.workers[0].lastActivityAt, T0 + 140_000);
+  assert.equal(first.state.workers[1].lastActivityAt, T0 + 1_000);
 });
 
 test("tick: CI red nudge rounds then CI_ROUNDS_EXHAUSTED once", () => {

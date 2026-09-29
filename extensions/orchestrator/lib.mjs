@@ -309,6 +309,7 @@ export function resolveWorkerCwd(worker, liveCwd, fallbackCwd) {
 // world = {
 //   liveAgents: [{name, paneId, agentStatus, stateChangeSeq}],  // herdr truth, ALL agents
 //   paneScreen: string|null,   // worker recent-unwrapped screen text
+//   sessionActivityAt: { [workerName]: number|null }, // worker JSONL mtime in ms
 //   pr: {number, state: "OPEN"|"MERGED"|"CLOSED", anyFailed, allConcluded} | null,
 //   repoSlug: "owner/repo"
 // }
@@ -345,9 +346,7 @@ export function tick(prevState, world, config, now) {
     if (live.stateChangeSeq !== worker.lastChangeSeq) {
       worker.lastChangeSeq = live.stateChangeSeq;
       worker.lastActivityAt = now;
-      worker.stallEscaped = false;
       worker.stallReported = false;
-      worker.stallAt = null;
     }
     const status = live.agentStatus === "done" ? "idle" : live.agentStatus;
     if (status !== worker.lastStatus) {
@@ -382,15 +381,18 @@ export function tick(prevState, world, config, now) {
     }
 
     if (status === "working") {
-      if (now - worker.lastActivityAt >= config.stallSeconds * 1000) {
-        if (!worker.stallEscaped) {
-          actions.push({ type: "send_keys", worker: worker.name, keys: ["escape"] });
-          worker.stallEscaped = true;
-          worker.stallAt = now;
-        } else if (!worker.stallReported && now - worker.stallAt >= config.stallSeconds * 1000) {
-          events.push({ code: "STALL_PERSISTENT", tier: 2, worker: worker.name, ticket: worker.ticket });
-          worker.stallReported = true;
-        }
+      // Herdr's stateChangeSeq stays fixed throughout a turn. Transcript
+      // growth is progress even when the worker has been "working" for hours.
+      const activityAt = world.sessionActivityAt?.[worker.name];
+      if (Number.isFinite(activityAt) && activityAt > worker.lastActivityAt && activityAt <= now) {
+        worker.lastActivityAt = activityAt;
+        worker.stallReported = false;
+      }
+      if (!worker.stallReported && now - worker.lastActivityAt >= config.stallSeconds * 1000) {
+        // An old or unreadable transcript is ambiguous (e.g. a long model
+        // call). Wake the supervisor; never cancel an active turn with Escape.
+        events.push({ code: "STALL_PERSISTENT", tier: 2, worker: worker.name, ticket: worker.ticket });
+        worker.stallReported = true;
       }
       continue;
     }
