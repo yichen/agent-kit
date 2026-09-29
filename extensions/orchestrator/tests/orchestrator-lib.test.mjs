@@ -9,12 +9,17 @@ import {
   ciNudgeText,
   coalesceEvents,
   extractPrNumber,
+  findResumableSession,
   formatWakeMessage,
   initState,
   launchGate,
   matchesDialogAllowlist,
   mergeNudgeText,
+  resolveRepo,
+  resolveWorkerCwd,
   resumeNudgeText,
+  isAbortedTurnScreen,
+  ABORTED_TURN_PATTERN,
   tick,
   validateConfig,
 } from "../lib.mjs";
@@ -378,12 +383,151 @@ test("formatWakeMessage: batches codes with ids and tier3 marker", () => {
 
 // ---------- nudge text determinism ----------
 
+// ---------- repo registry ----------
+
+const REGISTRY = {
+  repos: {
+    learnrise: { path: "/Users/x/work/LearnRise" },
+    sharedanchor: { path: "/Users/x/work/SharedAnchor", invocation: "/code ticket:{ticket} profile:local" },
+  },
+};
+const allExist = () => true;
+
+test("validateConfig: repo registry accepts valid entries and rejects bad ones", () => {
+  assert.equal(validateConfig({ ...REGISTRY }, { statePath: "/tmp/s.json" }).ok, true);
+  const cases = [
+    ["repos not object", { repos: [] }],
+    ["repos null", { repos: null }],
+    ["bad repo key", { repos: { "Bad Key": { path: "/x" } } }],
+    ["repo entry not object", { repos: { repo1: "/x" } }],
+    ["missing path", { repos: { repo1: {} } }],
+    ["empty path", { repos: { repo1: { path: "  " } } }],
+    ["unknown repo subkey", { repos: { repo1: { path: "/x", model: "m" } } }],
+    ["bad invocation", { repos: { repo1: { path: "/x", invocation: "" } } }],
+    ["bad startArgs", { repos: { repo1: { path: "/x", startArgs: [1] } } }],
+    ["bad ciCommand", { repos: { repo1: { path: "/x", ciCommand: "" } } }],
+  ];
+  for (const [label, raw] of cases) {
+    const result = validateConfig(raw, { statePath: "/tmp/s.json" });
+    assert.equal(result.ok, false, `expected failure: ${label}`);
+  }
+});
+
+
+test("resolveRepo: omitted key falls back to session cwd and default invocation", () => {
+  const cfg = baseConfig();
+  const resolved = resolveRepo(cfg, null, "/session/cwd", allExist);
+  assert.deepEqual(resolved, {
+    ok: true,
+    path: "/session/cwd",
+    invocation: cfg.worker.invocation,
+    startArgs: cfg.worker.startArgs,
+    ciCommand: cfg.ciCommand,
+    repo: null,
+  });
+});
+
+test("resolveRepo: registered key resolves path and per-repo overrides", () => {
+  const cfg = baseConfig({ ...REGISTRY });
+  const resolved = resolveRepo(cfg, "sharedanchor", "/session/cwd", allExist);
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.path, "/Users/x/work/SharedAnchor");
+  assert.equal(resolved.invocation, "/code ticket:{ticket} profile:local");
+  assert.equal(resolved.repo, "sharedanchor");
+  assert.equal(resolved.ciCommand, cfg.ciCommand);
+  const plain = resolveRepo(cfg, "learnrise", "/session/cwd", allExist);
+  assert.equal(plain.invocation, cfg.worker.invocation); // inherits default
+});
+
+test("resolveRepo: unknown key refuses with registered list; missing path refuses", () => {
+  const cfg = baseConfig({ ...REGISTRY });
+  const unknown = resolveRepo(cfg, "nope", "/session/cwd", allExist);
+  assert.equal(unknown.ok, false);
+  assert.match(unknown.error, /unknown repo 'nope'/);
+  assert.match(unknown.error, /learnrise, sharedanchor/);
+  const missing = resolveRepo(cfg, "learnrise", "/session/cwd", () => false);
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /does not exist/);
+});
+
+
+test("resolveWorkerCwd: recorded path wins, then live cwd, then fallback", () => {
+  assert.equal(resolveWorkerCwd({ repoPath: "/recorded" }, "/live", "/fallback"), "/recorded");
+  assert.equal(resolveWorkerCwd({}, "/live", "/fallback"), "/live");
+  assert.equal(resolveWorkerCwd(null, null, "/fallback"), "/fallback");
+  assert.equal(resolveWorkerCwd({ repoPath: "/recorded" }, null, "/fallback"), "/recorded");
+});
+
+// ---------- resume-first ----------
+
+test("findResumableSession: most recent matching ticket wins", () => {
+  const history = [
+    { name: "w1", ticket: 7, sessionPath: "/old.jsonl" },
+    { name: "w2", ticket: 9, sessionPath: "/other.jsonl" },
+    { name: "w3", ticket: 7, sessionPath: "/new.jsonl" },
+  ];
+  assert.equal(findResumableSession(history, 7), "/new.jsonl");
+  assert.equal(findResumableSession(history, 9), "/other.jsonl");
+});
+
+test("findResumableSession: fail-closed table", () => {
+  assert.equal(findResumableSession([{ ticket: 7 }], 7), null, "record without sessionPath");
+  assert.equal(findResumableSession([{ ticket: 8, sessionPath: "/x" }], 7), null, "ticket mismatch");
+  assert.equal(findResumableSession([], 7), null, "empty history");
+  assert.equal(findResumableSession(null, 7), null, "null history");
+  assert.equal(findResumableSession([{ ticket: 7, sessionPath: "/x" }], null), null, "null ticket");
+});
+
+test("tick: aborted turn gets fast nudge, once per episode, capped", () => {
+  const config = baseConfig({ autoAnswerCap: 2 });
+  const state = initState(1);
+  state.workers.push(makeWorker());
+  const aborted = { liveAgents: [live("orch-worker-1", "idle", "w1:p2", 1)], paneScreen: " Operation aborted", pr: null, repoSlug: "o/r" };
+  const healthy = { ...aborted, paneScreen: "all good" };
+
+  const first = tick(state, aborted, config, T0 + 10);
+  assert.equal(first.actions.length, 1);
+  assert.match(first.actions[0].text, /aborted mid-work/);
+  const second = tick(first.state, aborted, config, T0 + 20);
+  assert.deepEqual(second.actions, [], "no duplicate nudge within the same idle episode");
+
+  // Status change starts a new episode; second nudge consumed.
+  const working = tick(second.state, { ...aborted, liveAgents: [live("orch-worker-1", "working", "w1:p2", 2)] }, config, T0 + 30);
+  const third = tick(working.state, aborted, config, T0 + 40);
+  assert.equal(third.actions.length, 1, "second episode nudges again");
+
+  // Cap reached: further aborts wake the orchestrator instead of nudging.
+  const working2 = tick(third.state, { ...aborted, liveAgents: [live("orch-worker-1", "working", "w1:p2", 3)] }, config, T0 + 50);
+  const fourth = tick(working2.state, aborted, config, T0 + 60);
+  assert.deepEqual(fourth.actions, []);
+  assert.equal(fourth.events[0].code, "WORKER_ABORT_LOOP");
+  const fifth = tick(fourth.state, aborted, config, T0 + 70);
+  assert.deepEqual(fifth.events, [], "abort loop reported once");
+
+  // Healthy screen never triggers the abort path.
+  const fine = tick(fourth.state, healthy, config, T0 + 80);
+  assert.deepEqual(fine.actions, []);
+});
+
 test("nudge templates are deterministic and self-describing", () => {
   assert.equal(ciNudgeText(101, 7, 2, 5), ciNudgeText(101, 7, 2, 5));
   assert.match(ciNudgeText(101, 7, 2, 5), /root cause/);
   assert.match(ciNudgeText(101, 7, 2, 5), /round 2 of 5/);
   assert.match(mergeNudgeText(7), /PR #7/);
   assert.match(resumeNudgeText(101), /ticket 101/);
+  assert.match(" Operation aborted", new RegExp(ABORTED_TURN_PATTERN, "m"));
+  assert.doesNotMatch("Operation abortedly fine", new RegExp(ABORTED_TURN_PATTERN, "m"));
+});
+
+test("isAbortedTurnScreen: only the visible tail counts", () => {
+  assert.equal(isAbortedTurnScreen("working...\n Operation aborted"), true);
+  assert.equal(
+    isAbortedTurnScreen(" Operation aborted\nnow doing other things\nmade edits\nran tests\ntests pass"),
+    false,
+    "stale abort buried in scrollback",
+  );
+  assert.equal(isAbortedTurnScreen(""), false);
+  assert.equal(isAbortedTurnScreen(null), false);
 });
 
 // ---------- config default sanity ----------

@@ -17,6 +17,7 @@ export const DEFAULT_CONFIG = {
   prDiscovery: true,
   ciCommand: "gh",
   statePath: "",
+  repos: {},
   worker: {
     kind: "pi",
     namePrefix: "orch-worker",
@@ -51,6 +52,7 @@ export function validateConfig(raw, overrides = {}) {
     "prDiscovery",
     "ciCommand",
     "statePath",
+    "repos",
     "worker",
     "dialogAllowlist",
   ]);
@@ -90,6 +92,41 @@ export function validateConfig(raw, overrides = {}) {
   }
   if (typeof config.worker.invocation !== "string" || !config.worker.invocation.trim()) {
     errors.push("worker.invocation must be a non-empty string");
+  }
+  if (config.repos === null || typeof config.repos !== "object" || Array.isArray(config.repos)) {
+    errors.push("repos must be an object mapping repo keys to { path, ... }"
+    );
+  } else {
+    for (const [key, entry] of Object.entries(config.repos)) {
+      if (!NAME_RE.test(key)) {
+        errors.push(`repos key must match ^[a-z][a-z0-9_-]{0,31}$: ${key}`);
+        continue;
+      }
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        errors.push(`repos.${key} must be an object`);
+        continue;
+      }
+      for (const sub of Object.keys(entry)) {
+        if (!["path", "invocation", "startArgs", "ciCommand"].includes(sub)) {
+          errors.push(`unknown key in repos.${key}: ${sub}`);
+        }
+      }
+      if (typeof entry.path !== "string" || !entry.path.trim()) {
+        errors.push(`repos.${key}.path must be a non-empty string`);
+      }
+      if (entry.invocation !== undefined && (typeof entry.invocation !== "string" || !entry.invocation.trim())) {
+        errors.push(`repos.${key}.invocation must be a non-empty string`);
+      }
+      if (
+        entry.startArgs !== undefined &&
+        (!Array.isArray(entry.startArgs) || entry.startArgs.some((a) => typeof a !== "string"))
+      ) {
+        errors.push(`repos.${key}.startArgs must be an array of strings`);
+      }
+      if (entry.ciCommand !== undefined && (typeof entry.ciCommand !== "string" || !entry.ciCommand.trim())) {
+        errors.push(`repos.${key}.ciCommand must be a non-empty string`);
+      }
+    }
   }
   if (!Array.isArray(config.dialogAllowlist)) {
     errors.push("dialogAllowlist must be an array of regex-source strings");
@@ -191,6 +228,23 @@ export function resumeNudgeText(ticket) {
   );
 }
 
+export const ABORTED_TURN_PATTERN = "^\\s*Operation aborted\\s*$";
+
+// The abort marker lingers in scrollback long after recovery, so only the
+// last few non-empty screen lines count as "currently aborted".
+export function isAbortedTurnScreen(screenText, tailLines = 4) {
+  if (typeof screenText !== "string" || !screenText) return false;
+  const tail = screenText.split("\n").filter((line) => line.trim()).slice(-tailLines).join("\n");
+  return matchesDialogAllowlist(tail, [ABORTED_TURN_PATTERN]);
+}
+
+export function abortedNudgeText(ticket) {
+  return (
+    `Your last turn was aborted mid-work. Continue ticket ${ticket} exactly ` +
+    `where you left off.`
+  );
+}
+
 // ---------- launch gate ----------
 
 export function launchGate(state) {
@@ -199,6 +253,55 @@ export function launchGate(state) {
     return { allowed: false, reason: "at_cap", live, max: state.maxWorkers };
   }
   return { allowed: true, live, max: state.maxWorkers };
+}
+
+// Resume-first: find a prior session for this ticket that pi can resume.
+// Returns the session file path or null.
+export function findResumableSession(history, ticket) {
+  if (!Array.isArray(history) || ticket == null) return null;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const record = history[i];
+    if (record && record.ticket === ticket && typeof record.sessionPath === "string" && record.sessionPath) {
+      return record.sessionPath;
+    }
+  }
+  return null;
+}
+
+// ---------- repo registry ----------
+
+// Resolve a launch target. Omitting repoKey uses the orchestrator session's
+// own cwd (v1 behavior). An unknown key or a nonexistent path refuses the
+// launch — never guesses. `exists` is injected so tests stay pure.
+export function resolveRepo(config, repoKey, fallbackCwd, exists) {
+  if (repoKey == null || repoKey === "") {
+    return { ok: true, path: fallbackCwd, invocation: config.worker.invocation, startArgs: config.worker.startArgs, ciCommand: config.ciCommand, repo: null };
+  }
+  const entry = (config.repos ?? {})[repoKey];
+  if (!entry) {
+    const known = Object.keys(config.repos ?? {});
+    return { ok: false, error: `unknown repo '${repoKey}' (registered: ${known.length ? known.join(", ") : "none"})` };
+  }
+  if (!exists(entry.path)) {
+    return { ok: false, error: `repos.${repoKey}.path does not exist: ${entry.path}` };
+  }
+  return {
+    ok: true,
+    path: entry.path,
+    invocation: entry.invocation ?? config.worker.invocation,
+    startArgs: entry.startArgs ?? config.worker.startArgs,
+    ciCommand: entry.ciCommand ?? config.ciCommand,
+    repo: repoKey,
+  };
+}
+
+// Per-worker working directory with a v1 migration fallback:
+// recorded repoPath wins; otherwise the live herdr agent's reported cwd;
+// otherwise the orchestrator session's cwd.
+export function resolveWorkerCwd(worker, liveCwd, fallbackCwd) {
+  if (worker && worker.repoPath) return worker.repoPath;
+  if (liveCwd) return liveCwd;
+  return fallbackCwd;
 }
 
 // ---------- tick ----------
@@ -251,6 +354,7 @@ export function tick(prevState, world, config, now) {
       worker.lastStatus = status;
       worker.lastActivityAt = now;
       worker.blockedReported = false;
+      worker.abortNudged = false;
     }
 
     // One-time PR discovery from the pane screen, pinned to the origin repo.
@@ -294,6 +398,25 @@ export function tick(prevState, world, config, now) {
     if (status !== "idle") continue; // "unknown" or anything else: observe only
 
     worker.phase = worker.prNumber ? "awaiting_review" : "working";
+
+    // Fast abort recovery: an aborted turn leaves the worker idle with
+    // "Operation aborted" on screen. Nudge immediately (once per idle
+    // episode, capped) instead of waiting for the generic idle window.
+    if (isAbortedTurnScreen(world.paneScreen ?? "")) {
+      const nudges = worker.abortNudges ?? 0;
+      if (nudges < config.autoAnswerCap) {
+        if (!worker.abortNudged) {
+          actions.push({ type: "prompt", worker: worker.name, text: abortedNudgeText(worker.ticket) });
+          worker.abortNudged = true;
+          worker.abortNudges = nudges + 1;
+          worker.lastActivityAt = now;
+        }
+      } else if (!worker.abortReported) {
+        events.push({ code: "WORKER_ABORT_LOOP", tier: 2, worker: worker.name, ticket: worker.ticket });
+        worker.abortReported = true;
+      }
+      continue;
+    }
 
     if (worker.prNumber && world.pr && world.pr.number === worker.prNumber) {
       if (world.pr.state === "MERGED") {

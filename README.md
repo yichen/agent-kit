@@ -81,10 +81,13 @@ herdr/gh/filesystem effect lives in `extensions/orchestrator/executor.mjs`.
 
 Tier 1 (extension, no model tokens): templated CI-failure nudges up to
 `ciMaxRounds` (default 5), resume nudges, escape on stalls, allowlisted
-dialog auto-answers, pane close after merge.
+dialog auto-answers, pane close after merge, and fast abort recovery — a
+worker whose turn died ("Operation aborted") gets an immediate continue
+nudge (tail-anchored screen match, capped, then a `WORKER_ABORT_LOOP` wake).
 Tier 2 (wakes the orchestrator session): unknown blocked dialogs (fail
 closed — the default allowlist is empty), CI rounds exhausted, merge
-timeout, persistent stall, worker lost, cycle done (triage next ticket).
+timeout, persistent stall, worker lost, abort loop, cycle done (triage next
+ticket).
 Tier 3 (escalate to the human): the orchestrator session decides; prod
 data, consent/child-data, and legal boundaries are never auto-answered.
 
@@ -97,6 +100,33 @@ disable the watcher instead of guessing. State persists outside any repo at
 and is reconciled against live herdr truth every tick; herdr is the source
 of truth and pane IDs are never reused, so stale records are always
 detectable.
+
+### Multi-repo registry and resume-first (v2)
+
+One orchestrator session can drive workers in any registered repo. Add a
+`repos` map to the config:
+
+```json
+{
+  "repos": {
+    "learnrise": { "path": "/Users/me/work/LearnRise" },
+    "sharedanchor": { "path": "/Users/me/work/SharedAnchor",
+                      "invocation": "/code ticket:{ticket} profile:local" }
+  }
+}
+```
+
+`orch_launch_worker` accepts `repo:<key>` and opens the worker pane in that
+repo's path with its per-repo invocation/startArgs overrides; unknown keys
+or nonexistent paths refuse the launch. The 1-worker cap stays host-wide —
+one queue across all repos, which is what a single local model wants.
+
+Resume-first: every launch records the worker's pi session path, and
+`orch_change_worker {provider, model, reason}` changes a task's model or
+effort by relaunching the SAME session with `pi --session <path>` — ticket,
+repo, worktree, and CI-round count carry over (the round cap cannot be
+reset by switching models). A fresh `orch_launch_worker` for a ticket that
+has a resumable session is refused unless `forceFresh: true`.
 
 Run the no-token tests and the opt-in live canary (real herdr panes, real
 pi worker on ollama, stubbed `gh`; creates and closes its own panes and
