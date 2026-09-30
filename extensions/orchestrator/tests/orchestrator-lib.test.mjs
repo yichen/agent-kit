@@ -10,8 +10,10 @@ import { join } from "node:path";
 import { gatherWorld, sessionActivityAt } from "../executor.mjs";
 import {
   DEFAULT_CONFIG,
+  POLICY_KEYS,
   ciNudgeText,
   coalesceEvents,
+  effectivePolicy,
   extractPrNumber,
   findResumableSession,
   formatWakeMessage,
@@ -19,7 +21,10 @@ import {
   launchGate,
   matchesDialogAllowlist,
   mergeNudgeText,
+  normalizePolicy,
+  policyFrom,
   resolveRepo,
+  resolveTickPolicy,
   resolveWorkerCwd,
   resumeNudgeText,
   isAbortedTurnScreen,
@@ -361,6 +366,92 @@ test("tick: each worker uses only its own transcript activity", () => {
   assert.deepEqual(first.events.map((event) => event.worker), ["stale"]);
   assert.equal(first.state.workers[0].lastActivityAt, T0 + 140_000);
   assert.equal(first.state.workers[1].lastActivityAt, T0 + 1_000);
+});
+
+// The state file is host-wide but a config file is per repo, so a session that
+// never configured thresholds used to judge another repo's worker by its own
+// defaults. Incident 2026-09-30: defaults stallSeconds=900 raised
+// STALL_PERSISTENT for a worker whose owner had configured 3600, while that
+// worker sat in a 40-minute CI poll.
+test("policy: the published worker policy beats the observing session's defaults", () => {
+  const state = initState(1);
+  state.workers.push(makeWorker({ lastStatus: "working" }));
+  const world = {
+    liveAgents: [live("orch-worker-1", "working")],
+    paneScreen: null,
+    pr: null,
+    repoSlug: "o/r",
+    sessionActivityAt: { "orch-worker-1": T0 },
+  };
+  const observerDefaults = baseConfig({ stallSeconds: 900 });
+  const ownerPolicy = effectivePolicy(observerDefaults, { stallSeconds: 3600 });
+
+  const judgedByDefaults = tick(state, world, observerDefaults, T0 + 900_000 + 1);
+  assert.equal(judgedByDefaults.events[0]?.code, "STALL_PERSISTENT");
+
+  const withinOwnerWindow = tick(state, world, ownerPolicy, T0 + 900_000 + 1);
+  assert.deepEqual(withinOwnerWindow.events, []);
+  assert.deepEqual(withinOwnerWindow.actions, []);
+
+  const pastOwnerWindow = tick(state, world, ownerPolicy, T0 + 3_600_000 + 1);
+  assert.equal(pastOwnerWindow.events[0]?.code, "STALL_PERSISTENT");
+});
+
+test("policy: only well-formed published values are enforced", () => {
+  for (const [label, raw, expected] of [
+    ["non-object", "nonsense", {}],
+    ["array", [], {}],
+    ["null", null, {}],
+    ["missing", undefined, {}],
+    ["zero threshold", { stallSeconds: 0 }, {}],
+    ["negative threshold", { stallSeconds: -5 }, {}],
+    ["nan threshold", { stallSeconds: Number.NaN }, {}],
+    ["string threshold", { stallSeconds: "900" }, {}],
+    ["valid thresholds", { stallSeconds: 3600, ciMaxRounds: 3 }, { stallSeconds: 3600, ciMaxRounds: 3 }],
+    ["valid boolean and string", { prDiscovery: false, ciCommand: "gh" }, { prDiscovery: false, ciCommand: "gh" }],
+    ["blank ciCommand", { ciCommand: "  " }, {}],
+    ["non-string allowlist entry", { dialogAllowlist: ["ok", 7] }, {}],
+    ["valid allowlist", { dialogAllowlist: ["trust this file"] }, { dialogAllowlist: ["trust this file"] }],
+    ["unknown keys dropped", { stallSeconds: 60, worker: { kind: "pi" } }, { stallSeconds: 60 }],
+  ]) {
+    assert.deepEqual(normalizePolicy(raw), expected, label);
+  }
+});
+
+test("policy: published keys win one by one and everything else falls back", () => {
+  const local = baseConfig({ stallSeconds: 900, idleNudgeSeconds: 300, ciMaxRounds: 5 });
+  const published = effectivePolicy(local, { stallSeconds: 3600 });
+  assert.equal(published.stallSeconds, 3600);
+  assert.equal(published.idleNudgeSeconds, 300);
+  assert.equal(published.ciMaxRounds, 5);
+  assert.equal(published.maxWorkers, local.maxWorkers);
+  assert.equal(effectivePolicy(local, {}).stallSeconds, 900);
+  assert.equal(effectivePolicy(local, null).stallSeconds, 900);
+  assert.equal(effectivePolicy(local, { stallSeconds: "nope" }).stallSeconds, 900);
+});
+
+test("policy: a configured session adopts an unpublished policy exactly once", () => {
+  const config = baseConfig({ stallSeconds: 3600 });
+
+  const unconfigured = resolveTickPolicy(config, { version: 1 }, false);
+  assert.equal(unconfigured.publish, null, "an unconfigured session must not publish its defaults");
+  assert.equal(unconfigured.policy.stallSeconds, 3600);
+
+  const adopted = resolveTickPolicy(config, { version: 1 }, true);
+  assert.equal(adopted.publish.stallSeconds, 3600);
+  assert.equal(adopted.policy.stallSeconds, 3600);
+
+  const alreadyPublished = resolveTickPolicy(baseConfig({ stallSeconds: 900 }), { version: 1, policy: { stallSeconds: 1800 } }, true);
+  assert.equal(alreadyPublished.publish, null, "a published policy is never overwritten by a later session");
+  assert.equal(alreadyPublished.policy.stallSeconds, 1800, "and it governs that tick");
+});
+
+test("policy: a launch publishes exactly the decision keys", () => {
+  const published = policyFrom(baseConfig({ stallSeconds: 3600, ciMaxRounds: 4 }));
+  assert.equal(published.stallSeconds, 3600);
+  assert.equal(published.ciMaxRounds, 4);
+  assert.deepEqual(Object.keys(published).sort(), [...POLICY_KEYS].sort());
+  assert.deepEqual(normalizePolicy(published), published, "a published policy must round-trip");
 });
 
 test("tick: CI red nudge rounds then CI_ROUNDS_EXHAUSTED once", () => {

@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir as osTmpdir } from "node:os";
-import { tick, isValidState, resolveWorkerCwd } from "./lib.mjs";
+import { tick, isValidState, resolveWorkerCwd, policyFrom, resolveTickPolicy } from "./lib.mjs";
 
 export function run(cmd, args, timeoutMs = 30000) {
   return new Promise((resolve) => {
@@ -214,6 +214,9 @@ export async function changeWorker(statePath, config, change, cwd = process.cwd(
     changedAt: Date.now(),
     changeReason: change.reason ?? null,
   });
+  // A relaunched worker is owned by this session, so this session's thresholds
+  // are the ones its watcher must obey from here on.
+  state.policy = policyFrom(config);
   saveState(statePath, state);
   await applyAction({
     type: "prompt",
@@ -223,10 +226,14 @@ export async function changeWorker(statePath, config, change, cwd = process.cwd(
   return { ok: true, record: state.workers[0] };
 }
 // Returns { actions, newEvents } for the caller (pi wake logic / canary assertions).
-export async function runTick(statePath, config, cwd = process.cwd()) {
+// `options.explicit` is true when this session loaded a config file for its own
+// repo. Only such a session may publish thresholds that other sessions then obey.
+export async function runTick(statePath, config, cwd = process.cwd(), options = {}) {
   const state = loadState(statePath) ?? { version: 1, maxWorkers: config.maxWorkers, workers: [], history: [], pendingEvents: [] };
-  const world = await gatherWorld(config, state, cwd);
-  const { state: nextState, actions, events } = tick(state, world, config, Date.now());
+  const { policy, publish } = resolveTickPolicy(config, state, options.explicit === true);
+  if (publish) state.policy = publish;
+  const world = await gatherWorld(policy, state, cwd);
+  const { state: nextState, actions, events } = tick(state, world, policy, Date.now());
   for (const action of actions) {
     await applyAction(action);
   }

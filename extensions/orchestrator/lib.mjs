@@ -164,6 +164,69 @@ export function isValidState(state) {
   );
 }
 
+// ---------- worker policy ----------
+
+// Thresholds decide when the watcher wakes the orchestrator or nudges a worker.
+// The state file is shared by every pi session on the host, but a config file is
+// per repo. A session whose cwd has no `.pi/orchestrator.json` therefore used to
+// apply its DEFAULT thresholds to another repo's worker.
+//
+// Incident 2026-09-30: a session with default stallSeconds=900 raised
+// STALL_PERSISTENT for a worker whose owner had configured 3600, while the worker
+// was mid-tool-call on a 40-minute CI poll. The policy published with the worker
+// governs it, not whatever the observing session happens to default to.
+
+export const POLICY_KEYS = [
+  "stallSeconds",
+  "idleNudgeSeconds",
+  "mergeNudgeSeconds",
+  "ciMaxRounds",
+  "autoAnswerCap",
+  "prDiscovery",
+  "ciCommand",
+  "dialogAllowlist",
+];
+
+// Keep only the decision keys this module can enforce, and only when each value
+// is well formed. A hand-edited or truncated policy must never turn a threshold
+// into NaN (which silently disables every stall check) or into a negative number.
+// Anything rejected here falls back to the local config.
+export function normalizePolicy(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const policy = {};
+  for (const key of ["stallSeconds", "idleNudgeSeconds", "mergeNudgeSeconds", "ciMaxRounds", "autoAnswerCap"]) {
+    const value = raw[key];
+    if (Number.isFinite(value) && value > 0) policy[key] = value;
+  }
+  if (typeof raw.prDiscovery === "boolean") policy.prDiscovery = raw.prDiscovery;
+  if (typeof raw.ciCommand === "string" && raw.ciCommand.trim()) policy.ciCommand = raw.ciCommand;
+  if (Array.isArray(raw.dialogAllowlist) && raw.dialogAllowlist.every((p) => typeof p === "string")) {
+    policy.dialogAllowlist = raw.dialogAllowlist;
+  }
+  return policy;
+}
+
+// The policy to publish for a worker this session launches.
+export function policyFrom(config) {
+  return normalizePolicy(config);
+}
+
+// The policy a tick must obey: the published worker policy wins over local config.
+export function effectivePolicy(config, published) {
+  return { ...config, ...normalizePolicy(published) };
+}
+
+// Resolve the policy for one tick. A session that was explicitly configured for
+// this repo adopts the policy when nothing has published one yet, so a worker
+// launched before this rule existed stops being judged by foreign defaults on the
+// owner's next tick. Returns `publish` when state.policy must be written.
+export function resolveTickPolicy(config, state, explicit) {
+  const published = normalizePolicy(state?.policy);
+  const adopt = explicit === true && state?.policy == null;
+  const owned = adopt ? policyFrom(config) : published;
+  return { policy: { ...config, ...owned }, publish: adopt ? owned : null };
+}
+
 // ---------- pure helpers ----------
 
 // Only trust full PR URLs on the origin repo. Bare "#123", "PR #45" prose,
