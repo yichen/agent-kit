@@ -17,6 +17,7 @@ import {
   findResumableSession,
   formatWakeMessage,
   launchGate,
+  policyFrom,
   resolveRepo,
   validateConfig,
 } from "./lib.mjs";
@@ -40,8 +41,14 @@ function defaultStatePath(): string {
   return join(root, "orchestrator", "state.json");
 }
 
-function loadOrchestratorConfig(): { ok: true; config: OrchestratorConfig } | { ok: false; errors: string[] } {
+function loadOrchestratorConfig():
+  | { ok: true; config: OrchestratorConfig; explicit: boolean }
+  | { ok: false; errors: string[] } {
   const configPath = process.env.ORCH_CONFIG_PATH || join(process.cwd(), ".pi", "orchestrator.json");
+  // A config file (or an explicit ORCH_CONFIG_PATH) means this session was set up
+  // for this repo, so its thresholds may govern the shared worker record. A
+  // session with no config must never impose its defaults on another repo's worker.
+  const explicit = Boolean(process.env.ORCH_CONFIG_PATH) || fs.existsSync(configPath);
   let raw: unknown = {};
   try {
     if (fs.existsSync(configPath)) {
@@ -55,7 +62,7 @@ function loadOrchestratorConfig(): { ok: true; config: OrchestratorConfig } | { 
   };
   const result = validateConfig(raw as Record<string, unknown>, overrides);
   if (!result.ok) return { ok: false, errors: result.errors };
-  return { ok: true, config: result.config as OrchestratorConfig };
+  return { ok: true, config: result.config as OrchestratorConfig, explicit };
 }
 
 function workerRecord(state: ReturnType<typeof loadState>) {
@@ -100,7 +107,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
     if (!result.ok || ticking) return;
     ticking = true;
     try {
-      await runTick(statePath(), result.config, process.cwd());
+      await runTick(statePath(), result.config, process.cwd(), { explicit: result.explicit });
       await wakeIfPending(ctx);
     } catch {
       // Never let one bad poll kill the watcher; the next tick reconciles.
@@ -233,6 +240,10 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
         lastStatus: "idle",
         phase: "working",
       });
+      // Publish this repo's thresholds with the worker. Every pi session on the
+      // host shares one state file, so the observing session must not judge this
+      // worker by its own cwd defaults.
+      state.policy = policyFrom(cfg);
       saveState(path, state);
       await applyAction({ type: "prompt", worker: name, text: invocation });
       return textResult(
