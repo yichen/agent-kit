@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir as osTmpdir } from "node:os";
-import { tick, isValidState, resolveWorkerCwd, policyFrom, resolveTickPolicy } from "./lib.mjs";
+import { tick, isValidState, resolveWorkerCwd, policyFrom, resolveTickPolicy, summarizeRollup } from "./lib.mjs";
 
 export function run(cmd, args, timeoutMs = 30000) {
   return new Promise((resolve) => {
@@ -61,9 +61,7 @@ async function gatherPrStatus(config, prNumber) {
   if (!result.ok) return null;
   try {
     const json = JSON.parse(result.stdout);
-    const rollup = Array.isArray(json.statusCheckRollup) ? json.statusCheckRollup : [];
-    const anyFailed = rollup.some((c) => c.conclusion === "FAILURE");
-    const allConcluded = rollup.length > 0 && rollup.every((c) => c.status === "COMPLETED");
+    const { anyFailed, allConcluded } = summarizeRollup(json.statusCheckRollup);
     return { number: prNumber, state: json.state ?? "UNKNOWN", anyFailed, allConcluded };
   } catch {
     return null;

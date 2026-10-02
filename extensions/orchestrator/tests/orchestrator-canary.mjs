@@ -57,8 +57,17 @@ const ghControl = join(scratch, "gh-control.json");
 writeFileSync(ghStub, `#!/usr/bin/env bash\ncat '${ghControl}'\n`);
 chmodSync(ghStub, 0o755);
 
+// The live API returns each Vercel deployment as a StatusContext entry that
+// carries `state` and has no `status` field. The stub mirrors that shape so the
+// canary exercises the same rollup production sees; a status-only stub hid the
+// defect that made the merge nudge unreachable.
+const VERCEL_STATUS_CONTEXTS = [
+  { __typename: "StatusContext", context: "Vercel – shared-anchor", state: "SUCCESS" },
+  { __typename: "StatusContext", context: "Vercel – shared-anchor-staging", state: "SUCCESS" },
+];
+
 function setGh(state, rollup) {
-  writeFileSync(ghControl, JSON.stringify({ state, statusCheckRollup: rollup }));
+  writeFileSync(ghControl, JSON.stringify({ state, statusCheckRollup: [...rollup, ...VERCEL_STATUS_CONTEXTS] }));
 }
 
 const config = validateConfig(
