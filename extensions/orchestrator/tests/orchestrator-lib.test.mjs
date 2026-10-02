@@ -27,6 +27,7 @@ import {
   resolveTickPolicy,
   resolveWorkerCwd,
   resumeNudgeText,
+  summarizeRollup,
   isAbortedTurnScreen,
   ABORTED_TURN_PATTERN,
   tick,
@@ -194,6 +195,78 @@ test("sessionActivityAt: read-only observation of valid and invalid sessions", (
     assert.equal(readFileSync(path, "utf8"), '{"type":"message"}\n');
     assert.equal(statSync(path).mtimeMs, before.mtimeMs, "observation must not write the transcript");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("summarizeRollup: reads both CheckRun and StatusContext shapes", () => {
+  const run = (status, conclusion) => ({ __typename: "CheckRun", status, conclusion });
+  const ctx = (state) => ({ __typename: "StatusContext", state });
+  const cases = [
+    ["all green CheckRuns", [run("COMPLETED", "SUCCESS")], false, true],
+    ["live shape: CheckRun plus Vercel StatusContext", [run("COMPLETED", "SUCCESS"), ctx("SUCCESS")], false, true],
+    ["pending CheckRun keeps the rollup open", [run("IN_PROGRESS", null), ctx("SUCCESS")], false, false],
+    ["queued CheckRun keeps the rollup open", [run("QUEUED", null)], false, false],
+    ["pending StatusContext keeps the rollup open", [run("COMPLETED", "SUCCESS"), ctx("PENDING")], false, false],
+    ["expected StatusContext keeps the rollup open", [ctx("EXPECTED")], false, false],
+    ["failing CheckRun", [run("COMPLETED", "FAILURE")], true, true],
+    ["cancelled CheckRun is not green", [run("COMPLETED", "CANCELLED")], true, true],
+    ["timed out CheckRun is not green", [run("COMPLETED", "TIMED_OUT")], true, true],
+    ["action required CheckRun is not green", [run("COMPLETED", "ACTION_REQUIRED")], true, true],
+    ["startup failure CheckRun is not green", [run("COMPLETED", "STARTUP_FAILURE")], true, true],
+    ["neutral CheckRun is green", [run("COMPLETED", "NEUTRAL")], false, true],
+    ["skipped CheckRun is green", [run("COMPLETED", "SKIPPED")], false, true],
+    ["unrecognized conclusion is not green", [run("COMPLETED", "SOMETHING_NEW")], true, true],
+    ["completed without a conclusion is not green", [run("COMPLETED", null)], true, true],
+    ["failing StatusContext is a failure, not invisible", [ctx("FAILURE")], true, true],
+    ["error StatusContext is a failure", [ctx("ERROR")], true, true],
+    ["failure beside a green StatusContext", [run("COMPLETED", "FAILURE"), ctx("SUCCESS")], true, true],
+    ["empty rollup is not concluded", [], false, false],
+    ["non-array rollup is not concluded", null, false, false],
+    ["unknown shape fails closed", [{ foo: 1 }], false, false],
+    ["malformed entries fail closed", [null, "x", 7], false, false],
+    ["non-string fields fail closed", [{ status: 123, state: 7 }], false, false],
+    ["undefined rollup is not concluded", undefined, false, false],
+    ["unknown state string is not concluded", [{ state: "WEIRD" }], false, false],
+    ["empty object is not concluded", [{}], false, false],
+    ["status wins over a stale state field", [{ status: "QUEUED", state: "SUCCESS" }], false, false],
+    ["a failure conclusion is not masked by a stale state", [{ status: "COMPLETED", conclusion: "FAILURE", state: "PENDING" }], true, true],
+    ["one pending entry keeps a mostly green rollup open", [run("COMPLETED", "SUCCESS"), ctx("SUCCESS"), run("IN_PROGRESS", null)], false, false],
+  ];
+  for (const [label, rollup, anyFailed, allConcluded] of cases) {
+    assert.deepEqual(summarizeRollup(rollup), { anyFailed, allConcluded }, label);
+  }
+});
+
+test("gatherWorld: merge-ready rollup when Vercel returns StatusContext entries", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-rollup-"));
+  const oldPath = process.env.PATH;
+  try {
+    const herdr = join(dir, "herdr");
+    const gh = join(dir, "gh");
+    const agents = { result: { agents: [{ name: "orch-worker-1", agent_status: "idle", state_change_seq: 1, pane_id: "w1:p2", cwd: dir }] } };
+    const liveRollup = {
+      state: "OPEN",
+      statusCheckRollup: [
+        { __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS", name: "CI" },
+        { __typename: "StatusContext", context: "Vercel – shared-anchor", state: "SUCCESS" },
+      ],
+    };
+    writeFileSync(herdr, `#!/bin/sh\ncase "$1 $2" in\n  "agent list") printf '%s\\n' '${JSON.stringify(agents)}' ;;\n  *) printf '' ;;\nesac\n`);
+    writeFileSync(gh, `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(liveRollup)}'\n`);
+    chmodSync(herdr, 0o755);
+    chmodSync(gh, 0o755);
+    process.env.PATH = `${dir}:${oldPath}`;
+    const state = initState(1);
+    state.workers.push(makeWorker({ prNumber: 42 }));
+    const world = await gatherWorld(baseConfig({ ciCommand: gh }), state, dir);
+    assert.equal(world.pr.allConcluded, true, "a green Vercel StatusContext must not keep the rollup open");
+    assert.equal(world.pr.anyFailed, false);
+    const decision = tick(state, world, baseConfig({ ciCommand: gh }), Date.now());
+    assert.equal(decision.actions.length, 1, "a green live-shaped rollup must reach the merge nudge");
+    assert.match(decision.actions[0].text, /All required checks on PR #42/);
+  } finally {
+    process.env.PATH = oldPath;
     rmSync(dir, { recursive: true, force: true });
   }
 });

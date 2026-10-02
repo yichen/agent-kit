@@ -266,6 +266,48 @@ export function coalesceEvents(events, cap = 5) {
   return merged.slice(0, cap);
 }
 
+// GitHub returns two different entry shapes in one statusCheckRollup array.
+// A CheckRun carries `status` plus `conclusion`; a commit StatusContext (for
+// example each Vercel deployment) carries `state` and has no `status` field at
+// all. Reading only `status` made every StatusContext look permanently pending
+// from the first one onward, which silently disabled the merge nudge and
+// MERGE_TIMEOUT in every repository that has such a status.
+export function isConcludedCheck(check) {
+  if (check === null || typeof check !== "object") return false;
+  if (typeof check.status === "string" && check.status) return check.status === "COMPLETED";
+  if (typeof check.state === "string" && check.state) {
+    return check.state === "SUCCESS" || check.state === "FAILURE" || check.state === "ERROR";
+  }
+  return false; // unknown shape: never claim the rollup finished
+}
+
+// The green set mirrors the repository's existing classifiers (the boss skill
+// treats FAILURE, CANCELLED, TIMED_OUT, ACTION_REQUIRED and STARTUP_FAILURE as
+// failed). Anything not green counts as failed, so an unrecognized conclusion
+// can never be announced to the worker as a passing check.
+const GREEN_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
+
+export function isFailedCheck(check) {
+  if (check === null || typeof check !== "object") return false;
+  // Read the red signal from both fields before the green one, so a mixed
+  // entry can never be reported green by short-circuiting past its failure.
+  if (check.state === "FAILURE" || check.state === "ERROR") return true;
+  if (typeof check.status === "string" && check.status) {
+    if (check.status !== "COMPLETED") return false; // still running, not failed
+    return !GREEN_CONCLUSIONS.has(check.conclusion);
+  }
+  return false;
+}
+
+// Pure summary of one rollup, so the decision is unit-testable without gh.
+export function summarizeRollup(rollup) {
+  const entries = Array.isArray(rollup) ? rollup : [];
+  return {
+    anyFailed: entries.some(isFailedCheck),
+    allConcluded: entries.length > 0 && entries.every(isConcludedCheck),
+  };
+}
+
 // ---------- nudge templates ----------
 
 export function ciNudgeText(ticket, pr, round, maxRounds) {
