@@ -41,6 +41,14 @@ Merge reviewed changes into `main`, then fast-forward this checkout so every hos
 
 ## Skills
 
+### doc-writer
+
+Writes and reviews Markdown in plain English, including reports, plans, tickets, temporary files and agent handoffs.
+Invoke as `/doc-writer` or let the agent select it when writing a document.
+It explains necessary code terms, preserves required templates and evidence, and requires reading the saved document before publication.
+The same review applies to chat replies explaining the document.
+Installing the skill makes it available across projects; it does not force every runtime to invoke it or replace project instructions.
+
 ### boss
 
 Coordinates one repository's coding tickets and PRs through a single master task. `/boss code` tracks dependencies, dispatches ready work through the host's task tools or a configured idempotent adapter, reports PR health and five-hour throughput, and hands monitoring to a verified host automation and hub task. The helper fails closed when task or monitor integration is unavailable.
