@@ -48,6 +48,7 @@ Invoke as `/doc-writer` or let the agent select it when writing a document.
 It explains necessary code terms, preserves required templates and evidence, and requires reading the saved document before publication.
 The same review applies to chat replies explaining the document.
 Installing the skill makes it available across projects; it does not force every runtime to invoke it or replace project instructions.
+The repository also includes `.claude/skills/doc-writer`, a relative link to `skills/doc-writer`, so Claude Code can discover it when opened in this checkout.
 
 ### boss
 
