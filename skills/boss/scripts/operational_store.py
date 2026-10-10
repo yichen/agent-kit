@@ -195,8 +195,24 @@ def reserve(con, repo, issue, phase, owner, generation, verb):
         raise
 
 
+def new_dispatch_token():
+    """A dispatch token that stays usable as a command-line value.
+
+    argparse reads a value beginning with "-" as another option, so
+    `finish --token <token>` fails with "expected one argument" for such a token.
+    token_urlsafe draws from an alphabet that includes "-", so roughly one token
+    in 64 was unusable from the command line and the action stayed dispatching.
+    A caller that already holds such a token can still pass it as
+    `--token=<token>`.
+    """
+    while True:
+        token = secrets.token_urlsafe(32)
+        if not token.startswith("-"):
+            return token
+
+
 def start_action(con, repo, issue, phase, owner, generation, aid):
-    token = secrets.token_urlsafe(32)
+    token = new_dispatch_token()
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     begin(con)
     try:

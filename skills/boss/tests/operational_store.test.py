@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "operational_store.py"
@@ -42,6 +43,79 @@ class OperationalStoreTests(unittest.TestCase):
         path = self.root / name
         path.write_text(json.dumps({"as_of": dt.datetime.now(dt.timezone.utc).isoformat(), "tasks": tasks}))
         return path
+
+    def test_dispatch_tokens_are_usable_as_command_line_values(self):
+        # argparse reads a value beginning with "-" as another option, so a token
+        # that began with a hyphen would make `finish --token <token>` exit 2 and
+        # leave the action dispatching. token_urlsafe can produce that, so the
+        # invariant is asserted rather than assumed.
+        sys.path.insert(0, str(SCRIPT.parent))
+        import operational_store
+
+        tokens = [operational_store.new_dispatch_token() for _ in range(2000)]
+        self.assertEqual([token for token in tokens if token.startswith("-")], [])
+        self.assertEqual(len(set(tokens)), len(tokens), "tokens must not repeat")
+        for token in tokens:
+            self.assertEqual(len(token), 43, "token length is relied on elsewhere")
+            self.assertRegex(token, r"^[A-Za-z0-9_-]+$")
+
+    def test_new_dispatch_token_redraws_a_value_the_command_line_cannot_carry(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import operational_store
+
+        draws = []
+
+        def fake_token_urlsafe(bits):
+            draws.append(bits)
+            if len(draws) == 1:
+                return "-leading-hyphen" + "a" * 27
+            return "safe-leading" + "b" * 31
+
+        original = operational_store.secrets
+        operational_store.secrets = types.SimpleNamespace(token_urlsafe=fake_token_urlsafe)
+        try:
+            token = operational_store.new_dispatch_token()
+        finally:
+            operational_store.secrets = original
+
+        self.assertFalse(token.startswith("-"))
+        self.assertEqual(len(draws), 2, "a hyphen-leading draw must be rejected and redrawn")
+
+    def test_start_action_returns_a_token_finish_can_always_carry(self):
+        # Binds start_action to the safe generator, and exercises the "--token="
+        # form that a caller holding an already-issued hyphen-leading token needs.
+        claim = self.claim()
+        action = self.call(*self.command("reserve", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--verb", "launch"))["action"]
+
+        sys.path.insert(0, str(SCRIPT.parent))
+        import operational_store
+
+        class ForcedSecrets:
+            def __init__(self):
+                self.draws = 0
+
+            def token_urlsafe(self, bits):
+                self.draws += 1
+                if self.draws == 1:
+                    return "-forced-leading-hyphen" + "a" * 21
+                return "forced-safe-leading" + "b" * 23
+
+        original = operational_store.secrets
+        forced = ForcedSecrets()
+        operational_store.secrets = forced
+        try:
+            connection = sqlite3.connect(self.db)
+            # The store keys claims by canonical GitHub slug, not by path, so read
+            # the row the CLI wrote rather than reconstructing the arguments.
+            stored = connection.execute("SELECT repo, issue, phase, owner, generation FROM claims WHERE status='active'").fetchone()
+            token = operational_store.start_action(connection, stored[0], stored[1], stored[2], stored[3], stored[4], action["action_id"])
+            connection.close()
+        finally:
+            operational_store.secrets = original
+
+        self.assertEqual(forced.draws, 2, "start_action must redraw a hyphen-leading token")
+        self.assertFalse(token.startswith("-"), "start_action must never return a token the CLI cannot carry")
+        self.call(*self.command("finish", "--issue", "14", "--phase", "implement", "--owner", "worker-A", "--generation", str(claim["generation"]), "--action-id", action["action_id"], f"--token={token}", "--evidence", "Host task tool returned without creating a task"))
 
     def test_separate_processes_allow_only_one_claimant(self):
         command = [sys.executable, str(SCRIPT), "--db", str(self.db), "claim", "--repo", str(self.repo), "--issue", "14", "--phase", "implement"]
