@@ -18,8 +18,11 @@ import {
   formatWakeMessage,
   launchGate,
   policyFrom,
+  providerFromStartArgs,
+  herdrReporterPath,
   resolveRepo,
   validateConfig,
+  workerLaunchArgs,
 } from "./lib.mjs";
 import {
   applyAction,
@@ -77,6 +80,10 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
   let configResult: ReturnType<typeof loadOrchestratorConfig> | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let ticking = false;
+  // True only when this session started the watcher. A headless process loads
+  // the extension without becoming the orchestrator, and it must not drain or
+  // persist the shared state file.
+  let active = false;
 
   function config() {
     if (!configResult) configResult = loadOrchestratorConfig();
@@ -91,6 +98,7 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
   // Flush pending judgment events into the conversation as one user message.
   // No-op while a turn is active (the agent_settled handler retries).
   async function wakeIfPending(ctx: ExtensionContext) {
+    if (!active) return;
     const result = config();
     if (!result.ok || !ctx.isIdle()) return;
     const path = statePath();
@@ -212,7 +220,20 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
       if (!paneId) {
         return textResult(`pane split failed: ${split.stderr || "no pane_id in response"}`, { failed: true });
       }
-      const startArgs = ["agent", "start", name, "--kind", cfg.worker.kind, "--pane", paneId, "--timeout", "60000", "--", ...repo.startArgs];
+      const workerArgs = workerLaunchArgs(repo.startArgs, providerFromStartArgs(repo.startArgs), process.env, fs.existsSync);
+      const startArgs = [
+        "agent",
+        "start",
+        name,
+        "--kind",
+        cfg.worker.kind,
+        "--pane",
+        paneId,
+        "--timeout",
+        "60000",
+        "--",
+        ...workerArgs,
+      ];
       const start = await herdrJson(startArgs);
       if (!start.ok) {
         await herdrJson(["pane", "close", paneId]); // never leave a dead pane behind
@@ -246,8 +267,13 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
       state.policy = policyFrom(cfg);
       saveState(path, state);
       await applyAction({ type: "prompt", worker: name, text: invocation });
+      // A missing reporter means the watcher cannot see this worker's blocked,
+      // idle, or working transitions. Say so instead of launching silently.
+      const reporterNote = fs.existsSync(herdrReporterPath())
+        ? ""
+        : ` WARNING: ${herdrReporterPath()} is missing, so this worker runs without Herdr agent reporting and the watcher cannot see its status.`;
       return textResult(
-        `worker ${name} launched in pane ${paneId} (repo ${repo.repo ?? "session-cwd"}, capacity now ${state.workers.length}/${cfg.maxWorkers}); invocation sent: ${invocation}`,
+        `worker ${name} launched in pane ${paneId} (repo ${repo.repo ?? "session-cwd"}, capacity now ${state.workers.length}/${cfg.maxWorkers}); invocation sent: ${invocation}${reporterNote}`,
         { name, paneId, ticket: params.ticket ?? null, repo: repo.repo },
       );
     },
@@ -334,11 +360,17 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    // Only an interactive session can be the orchestrator. A headless process
+    // (pi -p, --mode json, or one spawned by the subagent extension) reports no
+    // UI, and it must never start a second watcher over the same state file.
+    // RPC is interactive and has a UI, so it stays eligible.
+    if (!ctx.hasUI) return;
     const result = config();
     if (!result.ok) {
-      if (ctx.hasUI) ctx.ui.notify(`orchestrator disabled: ${result.errors.join("; ")}`, "warning");
+      ctx.ui.notify(`orchestrator disabled: ${result.errors.join("; ")}`, "warning");
       return;
     }
+    active = true;
     const interval = setInterval(() => {
       void pollTick(ctx);
     }, Math.max(5, result.config.pollSeconds) * 1000);
@@ -348,10 +380,12 @@ export default function orchestratorExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    if (!active) return;
     await wakeIfPending(ctx);
   });
 
   pi.on("session_shutdown", async () => {
+    active = false;
     if (timer) {
       clearInterval(timer);
       timer = null;

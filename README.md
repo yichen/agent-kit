@@ -88,6 +88,23 @@ cap, dialog allowlist, and wake batching are pure functions in
 `extensions/orchestrator/lib.mjs` with table-driven no-token tests; every
 herdr/gh/filesystem effect lives in `extensions/orchestrator/executor.mjs`.
 
+Workers start with extension discovery disabled (`-ne`) and only the Herdr
+reporter loaded back explicitly (`-e`, pointing at `herdr-agent-state.ts`).
+Every Pi session that loads this extension starts its own watcher on the same
+host-wide state file, so a worker that loaded it would tick, nudge, and save
+state for its own record while the orchestrator did the same.
+The reporter is loaded back because Herdr cannot report agent status without
+it, and the watcher would then miss blocked, idle, and working transitions.
+Two host-local files are referenced and skipped when they are absent:
+`herdr-agent-state.ts` always, and `deepseek-model.ts` only for the deepseek
+provider, which `-ne` would otherwise unregister.
+Disabling extension discovery also disables Pi's built-in extensions
+(`builtin:mcp`, `builtin:llama.cpp`, `builtin:codemode`, `builtin:tool-search`),
+and the worker path uses none of them.
+Only a session with a UI becomes the orchestrator, so an RPC-hosted session
+stays eligible while `--print` and `--json` sessions load the extension without
+starting a watcher or touching state.
+
 Tier 1 (extension, no model tokens): templated CI-failure nudges up to
 `ciMaxRounds` (default 5), resume nudges, allowlisted dialog auto-answers,
 pane close after merge, and fast abort recovery — a
