@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir as osTmpdir } from "node:os";
-import { tick, isValidState, resolveWorkerCwd, policyFrom, resolveTickPolicy, summarizeRollup } from "./lib.mjs";
+import { tick, isValidState, resolveWorkerCwd, policyFrom, resolveTickPolicy, summarizeRollup, workerLaunchArgs } from "./lib.mjs";
 
 export function run(cmd, args, timeoutMs = 30000) {
   return new Promise((resolve) => {
@@ -171,7 +171,12 @@ export async function changeWorker(statePath, config, change, cwd = process.cwd(
     return { ok: false, error: `worker ${worker.name} has no resumable pi session; launch fresh with orch_launch_worker forceFresh:true` };
   }
 
-  const args = ["--provider", change.provider, "--model", change.model, "--session", sessionPath];
+  const args = workerLaunchArgs(
+    ["--provider", change.provider, "--model", change.model, "--session", sessionPath],
+    change.provider,
+    process.env,
+    existsSync,
+  );
   const oldName = worker.name;
   const close = await applyAction({ type: "close_pane", worker: oldName, paneId: worker.paneId });
   if (!close.ok) return { ok: false, error: `close failed: ${close.stderr}` };

@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -47,7 +47,7 @@ async function waitFor(label, fn, timeoutMs = 240000, intervalMs = 2000) {
   throw new Error(`timeout waiting for ${label}${lastError ? `: ${lastError.message}` : ""}`);
 }
 
-const { validateConfig, launchGate } = await import(join(extDir, "lib.mjs"));
+const { validateConfig, launchGate, providerFromStartArgs, workerLaunchArgs } = await import(join(extDir, "lib.mjs"));
 const executor = await import(join(extDir, "executor.mjs"));
 
 // Stub `gh`: returns whatever JSON the control file currently holds, so the
@@ -107,7 +107,7 @@ try {
   assert.ok(workerPaneId, `pane split failed: ${split.stderr}`);
   const start = await executor.herdrJson([
     "agent", "start", workerName, "--kind", "pi", "--pane", workerPaneId, "--timeout", "60000", "--",
-    ...cfg.worker.startArgs,
+    ...workerLaunchArgs(cfg.worker.startArgs, providerFromStartArgs(cfg.worker.startArgs), process.env, existsSync),
   ]);
   assert.ok(start.ok, `agent start failed: ${start.stderr}`);
   console.log(`PASS worker ${workerName} live in pane ${workerPaneId}`);

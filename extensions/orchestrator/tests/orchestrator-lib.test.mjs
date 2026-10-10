@@ -23,11 +23,15 @@ import {
   mergeNudgeText,
   normalizePolicy,
   policyFrom,
+  providerFromStartArgs,
   resolveRepo,
   resolveTickPolicy,
   resolveWorkerCwd,
   resumeNudgeText,
   summarizeRollup,
+  herdrReporterPath,
+  workerExtensionArgs,
+  workerLaunchArgs,
   isAbortedTurnScreen,
   ABORTED_TURN_PATTERN,
   tick,
@@ -796,6 +800,80 @@ test("isAbortedTurnScreen: only the visible tail counts", () => {
 });
 
 // ---------- config default sanity ----------
+
+test("workerExtensionArgs: workers load only the herdr reporter back", () => {
+  const env = { PI_CODING_AGENT_DIR: "/tmp/agent-dir" };
+  const reporter = join("/tmp/agent-dir", "extensions", "herdr-agent-state.ts");
+  const cases = [
+    ["ollama provider", "ollama", ["-ne", "-e", reporter]],
+    ["no provider", null, ["-ne", "-e", reporter]],
+    ["unknown provider", "openai-codex", ["-ne", "-e", reporter]],
+    ["deepseek provider also loads its model registration", "deepseek", ["-ne", "-e", reporter, "-e", join("/tmp/agent-dir", "extensions", "deepseek-model.ts")]],
+  ];
+  for (const [label, provider, expected] of cases) {
+    assert.deepEqual(workerExtensionArgs(provider, env), expected, label);
+  }
+  // With no override the reporter is looked up under the home directory, so a
+  // worker never silently runs without Herdr reporting agent status.
+  const fallback = workerExtensionArgs("ollama", {});
+  assert.deepEqual(fallback.slice(0, 2), ["-ne", "-e"], "isolation flags must always come first");
+  assert.match(fallback[2], /[\\/]extensions[\\/]herdr-agent-state\.ts$/);
+  assert.equal(workerExtensionArgs("ollama", { PI_CODING_AGENT_DIR: "" })[2], fallback[2], "empty override falls back");
+  assert.equal(herdrReporterPath({ PI_CODING_AGENT_DIR: "/tmp/agent-dir" }), join("/tmp/agent-dir", "extensions", "herdr-agent-state.ts"));
+  assert.match(herdrReporterPath({}), /[\\/]extensions[\\/]herdr-agent-state\.ts$/);
+});
+
+test("workerExtensionArgs: a host without the extensions gets no dangling -e", () => {
+  const env = { PI_CODING_AGENT_DIR: "/tmp/agent-dir" };
+  const reporter = join("/tmp/agent-dir", "extensions", "herdr-agent-state.ts");
+  const deepseek = join("/tmp/agent-dir", "extensions", "deepseek-model.ts");
+  const cases = [
+    ["both present", () => true, "deepseek", ["-ne", "-e", reporter, "-e", deepseek]],
+    ["reporter missing", (p) => p !== reporter, "ollama", ["-ne"]],
+    ["only the provider file missing", (p) => p !== deepseek, "deepseek", ["-ne", "-e", reporter]],
+    ["nothing present", () => false, "deepseek", ["-ne"]],
+  ];
+  for (const [label, exists, provider, expected] of cases) {
+    assert.deepEqual(workerExtensionArgs(provider, env, exists), expected, label);
+  }
+  // Whatever survives the existence check stays first, and the repository args follow.
+  const launch = workerLaunchArgs(["--model", "m"], "ollama", env, (p) => p === reporter);
+  assert.deepEqual(launch, ["-ne", "-e", reporter, "--model", "m"]);
+});
+
+test("providerFromStartArgs: reads only a real provider value", () => {
+  const cases = [
+    [["--provider", "ollama", "--model", "m"], "ollama"],
+    [["--model", "m", "--provider", "deepseek"], "deepseek"],
+    [["--model", "m"], null],
+    [["--provider"], null],
+    [["--provider", ""], null],
+    [["--provider", 7], null],
+    [["--model", "deepseek/deepseek-flash", "--provider", "deepseek"], "deepseek"],
+    [["--model", "deepseek/deepseek-flash"], "deepseek"],
+    [["--model", "openai-codex/gpt-6.1-sol:medium"], "openai-codex"],
+    [["--model", "qwen3.8:27b-mlx-128k"], null],
+    [["--model", "sonnet:high"], null],
+    [["--provider", "ollama", "--model", "deepseek/deepseek-flash"], "ollama"],
+    [["--provider=", "--model", "m"], null],
+    [null, null],
+    ["not-an-array", null],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(providerFromStartArgs(input), expected, JSON.stringify(input));
+  }
+});
+
+test("workerLaunchArgs: a repository startArgs cannot remove isolation", () => {
+  const env = { PI_CODING_AGENT_DIR: "/tmp/agent-dir" };
+  const isolated = workerLaunchArgs(["--provider", "ollama", "--model", "m"], "ollama", env);
+  assert.deepEqual(isolated.slice(0, 2), ["-ne", "-e"], "flags come first");
+  assert.deepEqual(isolated.slice(3), ["--provider", "ollama", "--model", "m"], "repository args are preserved after the flags");
+  // A repository that sets its own startArgs still gets the flags prepended.
+  assert.deepEqual(workerLaunchArgs(["--model", "custom"], "deepseek", env).slice(0, 2), ["-ne", "-e"]);
+  assert.deepEqual(workerLaunchArgs(undefined, null, env).slice(0, 3), ["-ne", "-e", join("/tmp/agent-dir", "extensions", "herdr-agent-state.ts")]);
+  assert.deepEqual(workerLaunchArgs([], null, env).slice(3), []);
+});
 
 test("DEFAULT_CONFIG pins the agreed orchestration policy", () => {
   assert.equal(DEFAULT_CONFIG.maxWorkers, 1);

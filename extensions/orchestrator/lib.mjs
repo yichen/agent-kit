@@ -3,6 +3,66 @@
 // no-token unit tests and the live canary drive the exact same code paths
 // that the pi adapter (index.ts) runs in a real session.
 
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+// ---------- worker process isolation ----------
+
+// A worker session must not load this extension. Every pi session that loads it
+// starts a watcher on the same host-wide state file, so a worker would tick,
+// nudge, and save state for its own record while the orchestrator does the same.
+// `-ne` disables extension discovery, and the Herdr reporter is loaded back
+// explicitly because Herdr needs it to report agent status; without it the
+// watcher cannot see blocked, idle, or working transitions at all.
+// These extensions are host-local, so `exists` guards a host that does not have
+// them: passing `-e` for a missing file would otherwise lose the reporter or
+// fail the launch outright. Callers pass the real filesystem check; the default
+// keeps this function pure for the tests.
+export function herdrReporterPath(env = process.env) {
+  const agentDir = env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  return join(agentDir, "extensions", "herdr-agent-state.ts");
+}
+
+export function deepseekModelPath(env = process.env) {
+  const agentDir = env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  return join(agentDir, "extensions", "deepseek-model.ts");
+}
+
+export function workerExtensionArgs(provider, env = process.env, exists = () => true) {
+  const args = ["-ne"];
+  const reload = [herdrReporterPath(env)];
+  // `-ne` also drops the extension that registers this provider.
+  if (provider === "deepseek") reload.push(deepseekModelPath(env));
+  for (const path of reload) {
+    if (exists(path)) args.push("-e", path);
+  }
+  return args;
+}
+
+// The provider a startArgs array selects, when present. pi accepts either
+// `--provider <name>` or a `--model <provider>/<id>` reference, and it does not
+// accept the `--provider=<name>` form, so only those two shapes are read here.
+export function providerFromStartArgs(startArgs) {
+  if (!Array.isArray(startArgs)) return null;
+  const index = startArgs.indexOf("--provider");
+  const explicit = index === -1 ? undefined : startArgs[index + 1];
+  if (typeof explicit === "string" && explicit) return explicit;
+  const modelIndex = startArgs.indexOf("--model");
+  const model = modelIndex === -1 ? undefined : startArgs[modelIndex + 1];
+  if (typeof model === "string" && model.includes("/")) {
+    const [provider] = model.split("/");
+    return provider || null;
+  }
+  return null;
+}
+
+// Worker argv. Isolation flags come first so that a repository's own startArgs
+// cannot remove them by overriding the default list.
+export function workerLaunchArgs(startArgs, provider, env = process.env, exists = () => true) {
+  const base = Array.isArray(startArgs) ? startArgs : [];
+  return [...workerExtensionArgs(provider, env, exists), ...base];
+}
+
 // ---------- config ----------
 
 export const DEFAULT_CONFIG = {
