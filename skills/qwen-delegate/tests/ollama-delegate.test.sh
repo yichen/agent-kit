@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
     *) url="$1"; shift ;;
   esac
 done
-if [[ "$url" == */api/ps ]]; then
+if [[ "$url" == */v1/models ]]; then
   printf 'GET\n' >> "${FAKE_CALLS:?}"
   printf '%s' "${FAKE_PS:?}" > "$output"
   printf '%s' "${FAKE_PS_HTTP:-200}"
@@ -104,8 +104,8 @@ fresh_case() {
   export FAKE_CALLS="$CASE_DIR/calls"
   : > "$FAKE_CALLS"
   printf 'Turn these facts into a complete pull request body.\n' > "$CASE_DIR/prompt.txt"
-  export FAKE_PS='{"models":[{"name":"qwen3.8:27b-mlx-128k","context_length":65536}]}'
-  export FAKE_RESPONSE='{"response":"## Summary\n- Add local composition with safe fallback and deterministic validation.\n\n## Test plan\n- [x] Run the delegate helper tests and selector tests successfully.\n","prompt_eval_count":27,"eval_count":38,"done":true,"done_reason":"stop"}'
+  export FAKE_PS='{"object":"list","data":[{"id":"unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M","context_length":65536}]}'
+  export FAKE_RESPONSE='{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"## Summary\n- Add local composition with safe fallback and deterministic validation.\n\n## Test plan\n- [x] Run the delegate helper tests and selector tests successfully.\n"},"finish_reason":"stop"}],"usage":{"prompt_tokens":27,"completion_tokens":38,"total_tokens":65},"timings":{"prompt_ms":12.5,"predicted_ms":40.25}}'
   unset FAKE_PS_HTTP FAKE_PS_STATUS FAKE_HTTP FAKE_CURL_STATUS CAPTURE_REQUEST OLLAMA_DELEGATE_DISABLE FAKE_POST_READY FAKE_POST_RELEASE
   unset FAKE_CLEANUP_OWNER_PID FAKE_CLEANUP_REMOVE_READY FAKE_CLEANUP_REMOVE_RELEASE
 }
@@ -113,7 +113,7 @@ fresh_case() {
 fresh_case
 run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --unknown-option
 assert_eq "unknown option exits 1" 1 "$RUN_STATUS"
-assert_eq "bad usage does not call Ollama" 0 "$(wc -l < "$FAKE_CALLS" | tr -d ' ')"
+assert_eq "bad usage performs no network call" 0 "$(wc -l < "$FAKE_CALLS" | tr -d ' ')"
 assert_contains "bad usage is logged" "$OLLAMA_DELEGATE_LOG_FILE" '"outcome":"error"'
 
 fresh_case
@@ -174,8 +174,8 @@ export CAPTURE_REQUEST="$CASE_DIR/warm-request.json"
 run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --warm --caller maintenance/warm
 assert_eq "warm mode exits 0" 0 "$RUN_STATUS"
 assert_eq "warm mode posts without a loaded-model preflight" POST "$(tr -d '\n' < "$FAKE_CALLS")"
-node -e 'const r=require(process.argv[1]); if(r.model!=="qwen3.8:27b-mlx-128k"||r.prompt!==""||r.keep_alive!=="8h"||r.stream!==false||r.think!==false)process.exit(1)' "$CAPTURE_REQUEST"
-pass "warm mode pins the model and eight-hour residency"
+node -e 'const r=require(process.argv[1]); if(r.model!=="unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"||!Array.isArray(r.messages)||typeof r.messages[0].content!=="string"||r.max_tokens!==1||r.reasoning_effort!=="none"||r.stream!==false)process.exit(1)' "$CAPTURE_REQUEST"
+pass "warm mode pins the model, disables thinking, and asks for one token"
 assert_contains "warm mode is maintenance telemetry" "$OLLAMA_DELEGATE_LOG_FILE" '"event_type":"maintenance"'
 
 fresh_case
@@ -184,7 +184,7 @@ assert_eq "warm mode rejects generation arguments" 1 "$RUN_STATUS"
 assert_eq "invalid warm request performs no network call" 0 "$(wc -l < "$FAKE_CALLS" | tr -d ' ')"
 
 fresh_case
-export FAKE_PS='{"models":[{"name":"qwen3.8:27b-mlx-128k","context_length":1}]}'
+export FAKE_PS='{"data":[{"id":"unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M","context_length":1}]}'
 run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt"
 assert_eq "oversized prompt exits 2" 2 "$RUN_STATUS"
 assert_eq "oversized prompt is never posted" GET "$(tr -d '\n' < "$FAKE_CALLS")"
@@ -193,7 +193,7 @@ assert_contains "oversized prompt has its own outcome" "$OLLAMA_DELEGATE_LOG_FIL
 while IFS='|' read -r label prompt_text; do
   fresh_case
   printf '%s\n' "$prompt_text" > "$CASE_DIR/prompt.txt"
-  export FAKE_PS='{"models":[{"name":"qwen3.8:27b-mlx-128k","context_length":40}]}'
+  export FAKE_PS='{"data":[{"id":"unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M","context_length":40}]}'
   run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt"
   assert_eq "$label exits 2 under byte-safe prompt bound" 2 "$RUN_STATUS"
   assert_eq "$label is rejected before POST" GET "$(tr -d '\n' < "$FAKE_CALLS")"
@@ -209,9 +209,9 @@ run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt
 assert_eq "valid response exits 0" 0 "$RUN_STATUS"
 assert_contains "valid response reaches stdout" "$CASE_DIR/out" '## Summary'
 assert_eq "success releases the lock" absent "$([ -e "$OLLAMA_DELEGATE_LOCK_DIR" ] && echo present || echo absent)"
-assert_contains "success logs Ollama prompt tokens" "$OLLAMA_DELEGATE_LOG_FILE" '"prompt_tokens":27'
-node -e 'const r=require(process.argv[1]); if(r.model!=="qwen3.8:27b-mlx-128k"||r.stream!==false||r.think!==false)process.exit(1)' "$CAPTURE_REQUEST"
-pass "request pins the model and disables thinking and streaming"
+assert_contains "success logs prompt tokens" "$OLLAMA_DELEGATE_LOG_FILE" '"prompt_tokens":27'
+node -e 'const r=require(process.argv[1]); if(r.model!=="unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"||r.stream!==false||r.reasoning_effort!=="none"||r.max_tokens!==512||!Array.isArray(r.messages)||!r.messages[0].content.includes("Turn these facts"))process.exit(1)' "$CAPTURE_REQUEST"
+pass "request pins the model, disables thinking, sends the prompt as a user message, and bounds the reply"
 RECEIPT_ID="$(tr -d '\r\n' < "$CASE_DIR/receipt")"
 assert_eq "success returns a receipt ID" 32 "${#RECEIPT_ID}"
 if grep -Fq 'private-session-value' "$OLLAMA_DELEGATE_LOG_FILE"; then fail "raw session ID is never logged"; else pass "raw session ID is never logged"; fi
@@ -241,33 +241,64 @@ assert_eq "unknown receipt performs no network call" 0 "$(wc -l < "$FAKE_CALLS" 
 assert_contains "unknown receipt explains the mismatch" "$CASE_DIR/err" 'does not identify a matching successful attempt'
 
 fresh_case
-export FAKE_RESPONSE='{"response":"A response long enough to pass the length floor, but without the requested structural heading anywhere in its output body.","prompt_eval_count":10,"eval_count":20,"done":true,"done_reason":"stop"}'
+export FAKE_RESPONSE='{"choices":[{"index":0,"message":{"content":"A response long enough to pass the length floor, but without the requested structural heading anywhere in its output body."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}'
 run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt" --require-marker '## Summary' --min-chars 50
 assert_eq "missing structural marker exits 2" 2 "$RUN_STATUS"
 assert_contains "missing marker logs invalid output" "$OLLAMA_DELEGATE_LOG_FILE" '"outcome":"invalid_output"'
 
 fresh_case
-export FAKE_RESPONSE='{"response":"This sentence mentions ## Summary but does not contain the requested heading line. It is deliberately long enough to isolate structural validation.","prompt_eval_count":10,"eval_count":20,"done":true,"done_reason":"stop"}'
+export FAKE_RESPONSE='{"choices":[{"index":0,"message":{"content":"This sentence mentions ## Summary but does not contain the requested heading line. It is deliberately long enough to isolate structural validation."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}'
 run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt" --require-marker '## Summary' --min-chars 50
 assert_eq "inline marker text is not accepted as a heading" 2 "$RUN_STATUS"
 assert_contains "near-miss marker logs invalid output" "$OLLAMA_DELEGATE_LOG_FILE" '"reason":"missing_required_marker"'
 
 fresh_case
-export FAKE_RESPONSE='{"response":"## Summary\nA response with a malformed negative token count must not be accepted even though its body is otherwise long enough.","prompt_eval_count":-1,"eval_count":20,"done":true,"done_reason":"stop"}'
+export FAKE_RESPONSE='{"choices":[{"index":0,"message":{"content":"## Summary\nA response with a malformed negative token count must not be accepted even though its body is otherwise long enough."},"finish_reason":"stop"}],"usage":{"prompt_tokens":-1,"completion_tokens":20}}'
 run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt" --require-marker '## Summary' --min-chars 50
 assert_eq "negative response token count exits 2" 2 "$RUN_STATUS"
 assert_contains "negative token count logs malformed response" "$OLLAMA_DELEGATE_LOG_FILE" '"reason":"malformed_response"'
 
-while IFS='|' read -r label done_value done_reason expected_reason; do
+while IFS='|' read -r label finish_reason expected_reason; do
   fresh_case
-  export FAKE_RESPONSE="{\"response\":\"## Summary\\nThis response has headings and enough text but must be rejected because generation did not complete normally.\",\"prompt_eval_count\":10,\"eval_count\":20,\"done\":$done_value,\"done_reason\":\"$done_reason\"}"
+  export FAKE_RESPONSE="{\"choices\":[{\"index\":0,\"message\":{\"content\":\"## Summary\\nThis response has headings and enough text but must be rejected because generation did not complete normally.\"},\"finish_reason\":\"$finish_reason\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}"
   run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt" --require-marker '## Summary' --min-chars 50
   assert_eq "$label exits 2" 2 "$RUN_STATUS"
   assert_contains "$label logs incomplete output" "$OLLAMA_DELEGATE_LOG_FILE" "\"reason\":\"$expected_reason\""
 done <<'RESPONSE_CASES'
-done false|false|stop|incomplete_response_stop
-length stop|true|length|incomplete_response_length
+truncated at the token ceiling|length|incomplete_response_length
+filtered before any content|content_filter|incomplete_response_content_filter
 RESPONSE_CASES
+
+while IFS='|' read -r label body expected_reason; do
+  fresh_case
+  export FAKE_RESPONSE="$body"
+  run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt" --require-marker '## Summary' --min-chars 50
+  assert_eq "$label exits 2" 2 "$RUN_STATUS"
+  assert_contains "$label fails closed" "$OLLAMA_DELEGATE_LOG_FILE" "\"reason\":\"$expected_reason\""
+done <<'RESPONSE_SHAPE_CASES'
+thinking reply with null content|{"choices":[{"index":0,"message":{"content":null,"reasoning_content":"Thinking out loud instead of answering."},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}|malformed_response
+missing choices|{"usage":{"prompt_tokens":10,"completion_tokens":20}}|malformed_response
+missing usage|{"choices":[{"index":0,"message":{"content":"## Summary\nA reply long enough to pass the length floor but with no usage block at all."},"finish_reason":"stop"}]}|malformed_response
+numeric content instead of text|{"choices":[{"index":0,"message":{"content":42},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}|malformed_response
+RESPONSE_SHAPE_CASES
+
+fresh_case
+export FAKE_PS='{"data":[{"id":"some-other-model","context_length":65536}]}'
+run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt"
+assert_eq "a different served model exits 2" 2 "$RUN_STATUS"
+assert_eq "a different served model is never asked to answer" GET "$(tr -d '\n' < "$FAKE_CALLS")"
+assert_contains "a different served model logs its own outcome" "$OLLAMA_DELEGATE_LOG_FILE" '"reason":"model_not_loaded"'
+
+fresh_case
+export FAKE_PS_HTTP=503
+run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt"
+assert_eq "unready server exits 2" 2 "$RUN_STATUS"
+assert_contains "unready server logs the preflight status" "$OLLAMA_DELEGATE_LOG_FILE" '"reason":"preflight_http_503"'
+
+fresh_case
+export FAKE_PS='{"data":[{"id":"unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M","max_model_len":131072}]}'
+run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt" --require-marker '## Summary' --min-chars 50
+assert_eq "max_model_len is accepted as the context length" 0 "$RUN_STATUS"
 
 fresh_case
 export OLLAMA_DELEGATE_LOG_FILE="$CASE_DIR"
@@ -407,7 +438,7 @@ assert_eq "unverifiable caller pid exits 2" 2 "$RUN_STATUS"
 assert_contains "pid failure has a distinct outcome" "$OLLAMA_DELEGATE_LOG_FILE" '"outcome":"lock_identity_error"'
 
 fresh_case
-export FAKE_RESPONSE='{"response":"## Summary\n- Safe caller text remains data even with shell punctuation.\n\n## Test plan\n- [x] Nothing executes from the caller field, and this response is sufficiently long for validation.\n","prompt_eval_count":5,"eval_count":6,"done":true,"done_reason":"stop"}'
+export FAKE_RESPONSE='{"choices":[{"index":0,"message":{"content":"## Summary\n- Safe caller text remains data even with shell punctuation.\n\n## Test plan\n- [x] Nothing executes from the caller field, and this response is sufficiently long for validation.\n"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":6}}'
 INJECTION_TARGET="$CASE_DIR/must-not-exist"
 run_delegate "$CASE_DIR/out" "$CASE_DIR/err" --prompt-file "$CASE_DIR/prompt.txt" --caller "\$(touch $INJECTION_TARGET)" --require-marker '## Summary' --min-chars 50
 assert_eq "shell-like caller text remains inert" absent "$([ -e "$INJECTION_TARGET" ] && echo present || echo absent)"

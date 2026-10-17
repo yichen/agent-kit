@@ -1,6 +1,6 @@
 ---
 name: qwen-delegate
-description: Attempt short, bounded, non-authoritative text microtasks with the host's local Ollama Qwen 3.8 27B model, using hard prompt, output-token, and latency limits plus immediate normal-path fallback. Use for cheap-to-verify summaries, extraction, classification, micro-drafts, test candidates, small diff screens, and incident-evidence reviews; do not use for implementation, architecture, high-stakes decisions, final review, approval, or large-context work.
+description: Attempt short, bounded, non-authoritative text microtasks with the host's local Qwen 3.8 27B model, served by Splash over an OpenAI-compatible API on port 8000, using hard prompt, output-token, and latency limits plus immediate normal-path fallback. Use for cheap-to-verify summaries, extraction, classification, micro-drafts, test candidates, small diff screens, and incident-evidence reviews; do not use for implementation, architecture, high-stakes decisions, final review, approval, or large-context work.
 ---
 
 # Qwen Delegate
@@ -29,7 +29,7 @@ The main agent completes every non-delegated portion, checks every claim, path, 
 
 ## Generate a candidate
 
-Use [scripts/qwen-delegate.sh](scripts/qwen-delegate.sh). It applies task-specific hard ceilings before acquiring the shared lock, sets Ollama `num_predict`, never retries or queues, and publishes only an advisory V2 envelope.
+Use [scripts/qwen-delegate.sh](scripts/qwen-delegate.sh). It applies task-specific hard ceilings before acquiring the shared lock, caps generation with `max_tokens`, never retries or queues, and publishes only an advisory V2 envelope.
 
 Create a unique artifact directory under `${AGENTS_ARTIFACTS_ROOT:-$HOME/agents-artifacts}/qwen-delegate/`, write a bounded UTF-8 prompt, and choose a nonexistent output path:
 
@@ -69,6 +69,6 @@ The wrapper pins the shared lock and append-only telemetry used by other local-m
 - `$HOME/.local/state/sharedanchor-ollama-delegate/lock`
 - `$HOME/.local/state/sharedanchor-ollama-delegate/events.log`
 
-Do not override the lock, wait, retry contention, or enqueue work. The model must already be loaded. Telemetry records identity hashes, task type, outcome, token counts, and numerical timing only—not prompt or response content.
+Do not override the lock, wait, retry contention, or enqueue work. The Splash server must already be running and serving the pinned model. Telemetry records identity hashes, task type, outcome, token counts, and numerical timing only—not prompt or response content. The lock directory, the helper file names, and the `OLLAMA_DELEGATE_*` variables keep their historical names because other repositories call them; they no longer mean an Ollama service.
 
 Use `$HOME/.agents/skills/qwen-delegate/scripts/qwen-delegate-report.sh --date YYYY-MM-DD` for daily health, latency, throughput, verification yield, and verified-use value.

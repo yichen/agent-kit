@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run every tracked shell test without requiring a live Ollama service.
+# Run every tracked shell test without requiring a live local model service.
 
 set -euo pipefail
 
