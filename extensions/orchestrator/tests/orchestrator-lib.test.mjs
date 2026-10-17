@@ -899,5 +899,11 @@ test("DEFAULT_CONFIG pins the agreed orchestration policy", () => {
   assert.equal(DEFAULT_CONFIG.maxWorkers, 1);
   assert.equal(DEFAULT_CONFIG.ciMaxRounds, 5);
   assert.equal(DEFAULT_CONFIG.dialogAllowlist.length, 0); // fail closed: every dialog wakes the orchestrator
-  assert.deepEqual(DEFAULT_CONFIG.worker.startArgs, ["--provider", "ollama", "--model", "qwen3.8:27b-mlx-128k"]);
+  // Workers run on the Splash-served model on port 8000, not the Ollama one.
+  assert.deepEqual(DEFAULT_CONFIG.worker.startArgs, [
+    "--provider",
+    "splash",
+    "--model",
+    "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M",
+  ]);
 });
