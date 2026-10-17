@@ -147,6 +147,11 @@ export async function applyAction(action) {
       return run("herdr", ["agent", "prompt", action.worker, action.text]);
     case "close_pane":
       return run("herdr", ["pane", "close", action.paneId]);
+    case "mark_lost_pane":
+      // A lost worker's pane keeps its frozen transcript; the rename is the
+      // durable human-visible marker that the session is dead and its PR was
+      // handed off (see the lost branch in lib.mjs tick()).
+      return run("herdr", ["pane", "rename", action.paneId, action.title]);
     default:
       return { ok: false, stderr: `unknown action type: ${action.type}` };
   }
