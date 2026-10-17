@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Delegate bounded, prose-only composition to the already-loaded local Ollama model.
+# Delegate bounded, prose-only composition to the already-loaded local Qwen model
+# served by Splash through its OpenAI-compatible API.
+#
+# The file name, the OLLAMA_DELEGATE_* variables, and the OLLAMA_FALLBACK marker
+# are kept from the Ollama era because sibling repositories call this helper by
+# those names. Only the transport changed: Splash instead of Ollama.
 #
 # This script must be executed directly. Its PID ownership check is not reliable
 # when the file is sourced through `bash -c` or command substitution.
@@ -13,7 +18,7 @@
 #   ollama-delegate.sh --prompt-file <path> [options]
 #
 # Options:
-#   --model <tag>             Must equal the pinned qwen3.8:27b-mlx-128k tag
+#   --model <id>              Must equal the pinned unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M id
 #   --caller <name>           Calling skill or phase name for the event log
 #   --task-type-tag <name>    Optional bounded-work category for aggregate reporting
 #   --require-marker <text>   Required output text; may be repeated
@@ -24,11 +29,13 @@
 #   --mark-consumed <id>      Record that a previously validated result was actually used
 #   --record-result <id>      Record a V2 result lifecycle event
 #   --result-outcome <value>  delivered, verified_used, verified_rejected, or superseded
-#   --warm                    Load the pinned model and keep it resident for eight hours
+#   --warm                    Prove the pinned model answers through the running server
 #
 # Environment:
 #   OLLAMA_DELEGATE_DISABLE=1 forces a safe fallback.
-#   OLLAMA_DELEGATE_URL overrides http://127.0.0.1:11434.
+#   QWEN_DELEGATE_URL overrides http://127.0.0.1:8000 (Splash's default port).
+#   OLLAMA_DELEGATE_URL is still read as a lower-priority override.
+#   SPLASH_API_KEY, or QWEN_DELEGATE_API_KEY when set, is sent as a bearer token.
 #   OLLAMA_DELEGATE_LOCK_DIR overrides $HOME/.local/state/sharedanchor-ollama-delegate/lock.
 #   (Not /tmp: some setups clear /tmp on reboot, sleep, or a scheduled sweep,
 #   and the reclaim protocol is safer built once, on durable storage.)
@@ -37,14 +44,17 @@
 
 set -u
 
-MODEL="qwen3.8:27b-mlx-128k"
-PINNED_MODEL="qwen3.8:27b-mlx-128k"
+MODEL="unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
+PINNED_MODEL="unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
 CALLER="unknown"
 TASK_TYPE_TAG=""
 PROMPT_FILE=""
 MIN_CHARS=80
 TIMEOUT_SEC="${OLLAMA_DELEGATE_TIMEOUT:-60}"
-OLLAMA_URL="${OLLAMA_DELEGATE_URL:-http://127.0.0.1:11434}"
+SPLASH_URL="${QWEN_DELEGATE_URL:-${OLLAMA_DELEGATE_URL:-http://127.0.0.1:8000}}"
+SPLASH_API_KEY="${QWEN_DELEGATE_API_KEY:-${SPLASH_API_KEY:-}}"
+CURL_AUTH=()
+[ -z "$SPLASH_API_KEY" ] || CURL_AUTH=(-H "Authorization: Bearer $SPLASH_API_KEY")
 LOCK_DIR="${OLLAMA_DELEGATE_LOCK_DIR:-$HOME/.local/state/sharedanchor-ollama-delegate/lock}"
 LOG_FILE="${OLLAMA_DELEGATE_LOG_FILE:-$HOME/.local/state/sharedanchor-ollama-delegate/events.log}"
 MAX_LOCK_SECONDS=600
@@ -518,13 +528,19 @@ TMP_RESPONSE="$(mktemp)" || finish 2 error "mktemp_failed" 0 0
 if [ "$WARM" -eq 1 ]; then
   MODEL_TAG="$MODEL" REQUEST_PATH="$TMP_REQUEST" "$NODE_BIN" -e '
 const fs = require("fs");
-fs.writeFileSync(process.env.REQUEST_PATH, JSON.stringify({model: process.env.MODEL_TAG, prompt: "", stream: false, think: false, keep_alive: "8h"}));'
+fs.writeFileSync(process.env.REQUEST_PATH, JSON.stringify({
+  model: process.env.MODEL_TAG,
+  messages: [{role: "user", content: "Reply with the single word OK."}],
+  max_tokens: 1,
+  reasoning_effort: "none",
+  stream: false,
+}));'
   WARM_CURL_STATUS=0
-  WARM_HTTP_STATUS="$(curl -sS --connect-timeout 2 --max-time "$TIMEOUT_SEC" -o "$TMP_RESPONSE" -w '%{http_code}' -H 'Content-Type: application/json' --data-binary "@$TMP_REQUEST" "$OLLAMA_URL/api/generate" 2>/dev/null)" || WARM_CURL_STATUS=$?
+  WARM_HTTP_STATUS="$(curl -sS --connect-timeout 2 --max-time "$TIMEOUT_SEC" -o "$TMP_RESPONSE" -w '%{http_code}' -H 'Content-Type: application/json' ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} --data-binary "@$TMP_REQUEST" "$SPLASH_URL/v1/chat/completions" 2>/dev/null)" || WARM_CURL_STATUS=$?
   EVENT_ID="$(new_event_id)"
   if [ "$WARM_CURL_STATUS" -eq 0 ] && [ "$WARM_HTTP_STATUS" = "200" ]; then
     if log_event maintenance "$EVENT_ID" warmed "model_loaded" 0 0; then
-      printf 'Ollama model %s is warm for eight hours.\n' "$MODEL"
+      printf 'Splash model %s is loaded and answering.\n' "$MODEL"
       exit 0
     fi
   fi
@@ -533,22 +549,27 @@ fs.writeFileSync(process.env.REQUEST_PATH, JSON.stringify({model: process.env.MO
   exit 2
 fi
 
-PS_STATUS="$(curl -sS --connect-timeout 2 --max-time 5 -o "$TMP_PS" -w '%{http_code}' "$OLLAMA_URL/api/ps" 2>/dev/null)"
+PS_STATUS="$(curl -sS --connect-timeout 2 --max-time 5 -o "$TMP_PS" -w '%{http_code}' ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$SPLASH_URL/v1/models" 2>/dev/null)"
 if [ "$PS_STATUS" != "200" ]; then
-  echo "OLLAMA_FALLBACK: Ollama is unavailable (preflight HTTP ${PS_STATUS:-none})." >&2
+  echo "OLLAMA_FALLBACK: Splash is unavailable (preflight HTTP ${PS_STATUS:-none})." >&2
   finish 2 unavailable "preflight_http_${PS_STATUS:-none}" 0 0
 fi
 
+# Splash reports the served model, its context length, and whether it is the
+# resident one. A missing entry means the pinned model is not being served, so
+# delegation falls back instead of sending a request that cannot succeed.
 MODEL_CONTEXT="$(PS_FILE="$TMP_PS" MODEL_TAG="$MODEL" "$NODE_BIN" -e '
 const fs = require("fs");
 try {
   const payload = JSON.parse(fs.readFileSync(process.env.PS_FILE, "utf8"));
-  const item = Array.isArray(payload.models) && payload.models.find((entry) => entry && (entry.name === process.env.MODEL_TAG || entry.model === process.env.MODEL_TAG));
-  if (item && Number.isInteger(item.context_length) && item.context_length > 0) process.stdout.write(String(item.context_length));
+  const entries = Array.isArray(payload.data) ? payload.data : (Array.isArray(payload.models) ? payload.models : []);
+  const item = entries.find((entry) => entry && (entry.id === process.env.MODEL_TAG || entry.name === process.env.MODEL_TAG || entry.model === process.env.MODEL_TAG));
+  const contextLength = item && (item.context_length || item.max_model_len);
+  if (Number.isInteger(contextLength) && contextLength > 0) process.stdout.write(String(contextLength));
 } catch (_) {}'
 )"
 if ! [[ "$MODEL_CONTEXT" =~ ^[1-9][0-9]*$ ]]; then
-  echo "OLLAMA_FALLBACK: pinned model '$MODEL' is not loaded with a usable context length." >&2
+  echo "OLLAMA_FALLBACK: pinned model '$MODEL' is not served with a usable context length." >&2
   finish 2 unavailable "model_not_loaded" 0 0
 fi
 
@@ -561,9 +582,9 @@ try {
   process.stdout.write(String(raw.length));
 } catch (_) { process.exit(1); }'
 )" || usage_error "prompt file must be readable UTF-8 text"
-# Ollama exposes no tokenizer-only endpoint. One token per UTF-8 byte is a
-# deliberately conservative upper bound even for byte-fallback tokenizers,
-# dense punctuation, hashes, and non-Latin text.
+# Splash exposes no tokenizer-only endpoint this helper can rely on. One token
+# per UTF-8 byte is a deliberately conservative upper bound even for
+# byte-fallback tokenizers, dense punctuation, hashes, and non-Latin text.
 ESTIMATED_PROMPT_TOKENS="$PROMPT_BYTES"
 PROMPT_TOKEN_CAP=$(( MODEL_CONTEXT * 70 / 100 ))
 if [ "$ESTIMATED_PROMPT_TOKENS" -gt "$PROMPT_TOKEN_CAP" ]; then
@@ -573,12 +594,19 @@ fi
 
 PROMPT_PATH="$PROMPT_FILE" MODEL_TAG="$MODEL" REQUEST_PATH="$TMP_REQUEST" MAX_OUTPUT_TOKENS_VALUE="$MAX_OUTPUT_TOKENS" "$NODE_BIN" -e '
 const fs = require("fs");
-const request = {model: process.env.MODEL_TAG, prompt: fs.readFileSync(process.env.PROMPT_PATH, "utf8"), stream: false, think: false};
-if (process.env.MAX_OUTPUT_TOKENS_VALUE) request.options = {num_predict: Number(process.env.MAX_OUTPUT_TOKENS_VALUE)};
+const request = {
+  model: process.env.MODEL_TAG,
+  messages: [{role: "user", content: fs.readFileSync(process.env.PROMPT_PATH, "utf8")}],
+  stream: false,
+  // Splash puts a thinking reply in message.reasoning_content and leaves
+  // message.content null, so thinking must be off for a usable candidate.
+  reasoning_effort: "none",
+  max_tokens: Number(process.env.MAX_OUTPUT_TOKENS_VALUE || 512),
+};
 fs.writeFileSync(process.env.REQUEST_PATH, JSON.stringify(request));'
 
 CURL_STATUS=0
-HTTP_STATUS="$(curl -sS --connect-timeout 2 --max-time "$TIMEOUT_SEC" -o "$TMP_RESPONSE" -w '%{http_code}' -H 'Content-Type: application/json' --data-binary "@$TMP_REQUEST" "$OLLAMA_URL/api/generate" 2>/dev/null)" || CURL_STATUS=$?
+HTTP_STATUS="$(curl -sS --connect-timeout 2 --max-time "$TIMEOUT_SEC" -o "$TMP_RESPONSE" -w '%{http_code}' -H 'Content-Type: application/json' ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} --data-binary "@$TMP_REQUEST" "$SPLASH_URL/v1/chat/completions" 2>/dev/null)" || CURL_STATUS=$?
 if [ "$CURL_STATUS" -eq 28 ]; then
   echo "OLLAMA_FALLBACK: local model timed out after ${TIMEOUT_SEC}s." >&2
   finish 2 timeout "request_timeout" "$ESTIMATED_PROMPT_TOKENS" 0
@@ -593,9 +621,24 @@ const fs = require("fs");
 try {
   const payload = JSON.parse(fs.readFileSync(process.env.RESPONSE_PATH, "utf8"));
   const validInt = (value) => Number.isInteger(value) && value >= 0;
-  if (typeof payload.response !== "string" || payload.response.includes("\0") || !validInt(payload.prompt_eval_count) || !validInt(payload.eval_count) || typeof payload.done !== "boolean" || typeof payload.done_reason !== "string") throw new Error("shape");
-  for (const field of ["load_duration", "prompt_eval_duration", "eval_duration"]) if (!validInt(payload[field])) payload[field] = 0;
-  process.stdout.write([Buffer.from(payload.response).toString("base64"), payload.prompt_eval_count, payload.eval_count, payload.done ? "1" : "0", Buffer.from(payload.done_reason).toString("base64"), payload.load_duration, payload.prompt_eval_duration, payload.eval_duration].join("\n"));
+  const choice = Array.isArray(payload.choices) ? payload.choices[0] : null;
+  const message = choice && choice.message;
+  const usage = payload.usage;
+  if (!message || typeof message.content !== "string" || message.content.includes("\0")) throw new Error("shape");
+  if (typeof choice.finish_reason !== "string") throw new Error("shape");
+  if (!usage || !validInt(usage.prompt_tokens) || !validInt(usage.completion_tokens)) throw new Error("shape");
+  const timings = payload.timings && typeof payload.timings === "object" ? payload.timings : {};
+  const toNanoseconds = (milliseconds) => Number.isFinite(milliseconds) && milliseconds > 0 ? Math.round(milliseconds * 1e6) : 0;
+  process.stdout.write([
+    Buffer.from(message.content).toString("base64"),
+    usage.prompt_tokens,
+    usage.completion_tokens,
+    choice.finish_reason === "stop" ? "1" : "0",
+    Buffer.from(choice.finish_reason).toString("base64"),
+    0,
+    toNanoseconds(timings.prompt_ms),
+    toNanoseconds(timings.predicted_ms),
+  ].join("\n"));
 } catch (_) { process.exit(1); }'
 )" || {
   echo "OLLAMA_FALLBACK: local model returned malformed JSON." >&2

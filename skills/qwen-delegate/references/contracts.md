@@ -16,7 +16,7 @@ Read this reference when selecting limits, diagnosing rejected output, or record
 
 `--extended` is available only for `draft`, `test-plan`, `diff-screen`, and `incident-review`. It raises the output ceiling to 384 tokens and the absolute timeout to 30 seconds. It does not raise the prompt-byte ceiling. If useful work cannot fit, keep it on the normal path.
 
-Prompt bytes are a conservative transport bound because Ollama does not expose a tokenizer-only endpoint. The helper retains its separate context-safety check.
+Prompt bytes are a conservative transport bound because the helper has no tokenizer-only endpoint to call. The helper retains its separate context-safety check.
 
 ## Published envelope
 

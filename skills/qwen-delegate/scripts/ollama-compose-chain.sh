@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Generic bounded composition chain: Ollama, then caller fallback.
+# Generic bounded composition chain: local delegate, then caller fallback.
 #
 # Shared by any call site that wants the same shape as pr-compose-delegates.sh
-# (attempt local Ollama first, validate its output, fall back to the calling
+# (attempt the local Qwen delegate first, validate its output, fall back to the calling
 # agent otherwise) without owning its own template/bullets assembly. The
 # caller builds the full prompt text itself and passes it via --prompt-file.
 #
@@ -94,16 +94,16 @@ if [ -x "$OLLAMA_DELEGATE" ]; then
   if [ "$OLLAMA_STATUS" -eq 0 ]; then
     FIRST_LINE_LENGTH="$(awk 'NR == 1 { print length; exit }' "$OLLAMA_OUT")"
     if [ "$MAX_FIRST_LINE_CHARS" -gt 0 ] && { [ "${FIRST_LINE_LENGTH:-0}" -eq 0 ] || [ "$FIRST_LINE_LENGTH" -gt "$MAX_FIRST_LINE_CHARS" ]; }; then
-      echo "ollama-compose-chain: Ollama output first line must contain 1-${MAX_FIRST_LINE_CHARS} characters" >&2
+      echo "ollama-compose-chain: delegate output first line must contain 1-${MAX_FIRST_LINE_CHARS} characters" >&2
     elif cp "$OLLAMA_OUT" "$OUTPUT_FILE"; then
       RECEIPT_ID="$(tr -d '\r\n' < "$OLLAMA_RECEIPT")"
       if "$OLLAMA_DELEGATE" --mark-consumed "$RECEIPT_ID" --caller "$CALLER" >/dev/null 2>> "$OLLAMA_ERR"; then
         exit 0
       fi
       rm -f "$OUTPUT_FILE"
-      echo "ollama-compose-chain: could not record consumed Ollama output for caller '$CALLER'" >&2
+      echo "ollama-compose-chain: could not record consumed delegate output for caller '$CALLER'" >&2
     fi
-    echo "ollama-compose-chain: could not publish Ollama output for caller '$CALLER'" >&2
+    echo "ollama-compose-chain: could not publish delegate output for caller '$CALLER'" >&2
   fi
 fi
 

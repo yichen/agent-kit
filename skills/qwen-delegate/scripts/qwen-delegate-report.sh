@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Print a deterministic daily health and diverted-work report from Ollama events.
+# Print a deterministic daily health and diverted-work report from local-delegate events.
 # The default mode is read-only. --notify adds a macOS alert only when a day
 # with at least one attempt has zero successes or a success rate below 80%.
 
@@ -213,8 +213,8 @@ console.log("Caveat: the Max plan is a flat subscription, so this value is not c
 console.log("Caveat: local and Claude tokenizers and verbosity differ, so this estimates equivalent work rather than Claude tokens actually emitted.");
 
 if (notify && production.length && (successes.length === 0 || successRate < 80)) {
-  const message = `${reportDate}: ${successes.length}/${production.length} Ollama delegate attempts succeeded (${successRate.toFixed(0)}%). Run /ollama-report.`;
-  const script = `display notification ${JSON.stringify(message)} with title "SharedAnchor Ollama delegate" sound name "Basso"`;
+  const message = `${reportDate}: ${successes.length}/${production.length} local delegation attempts succeeded (${successRate.toFixed(0)}%). Run /ollama-report.`;
+  const script = `display notification ${JSON.stringify(message)} with title "SharedAnchor local delegate" sound name "Basso"`;
   spawnSync("osascript", ["-e", script], {stdio: "ignore"});
 }
 NODE
