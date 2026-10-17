@@ -81,7 +81,7 @@ export const DEFAULT_CONFIG = {
   worker: {
     kind: "pi",
     namePrefix: "orch-worker",
-    startArgs: ["--provider", "ollama", "--model", "qwen3.8:27b-mlx-128k"],
+    startArgs: ["--provider", "splash", "--model", "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"],
     invocation: "/code ticket:{ticket} profile:local",
   },
   dialogAllowlist: [],
