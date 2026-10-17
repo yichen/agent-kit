@@ -503,6 +503,18 @@ export function tick(prevState, world, config, now) {
       } else if (worker.phase !== "done") {
         worker.phase = "lost";
         events.push({ code: "WORKER_LOST", tier: 2, worker: worker.name, ticket: worker.ticket });
+        // The dead pane keeps its frozen transcript, which a reader can mistake
+        // for current state (seen 2026-10-16: pane showed "PR is not merged"
+        // hours after the merge). Rename it so the loss is visible at a glance.
+        if (worker.paneId) {
+          const pr = worker.prNumber != null ? ` pr=${worker.prNumber}` : "";
+          actions.push({
+            type: "mark_lost_pane",
+            worker: worker.name,
+            paneId: worker.paneId,
+            title: `LOST ${worker.name} #${worker.ticket}${pr}`,
+          });
+        }
       }
       continue;
     }

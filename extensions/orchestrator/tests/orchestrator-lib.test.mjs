@@ -316,13 +316,33 @@ test("gatherWorld: per-worker progress and session fallback without writes", asy
 
 // ---------- tick: lifecycle table ----------
 
-test("tick: pane gone without merge -> WORKER_LOST, archived", () => {
+test("tick: pane gone without merge -> WORKER_LOST + mark_lost_pane action, archived", () => {
   const state = initState(1);
   state.workers.push(makeWorker());
-  const { state: next, events } = tick(state, { liveAgents: [], paneScreen: null, pr: null, repoSlug: "o/r" }, baseConfig(), T0 + 10);
+  const { state: next, actions, events } = tick(state, { liveAgents: [], paneScreen: null, pr: null, repoSlug: "o/r" }, baseConfig(), T0 + 10);
   assert.equal(next.workers.length, 0);
   assert.equal(next.history[0].phase, "lost");
   assert.equal(events[0].code, "WORKER_LOST");
+  assert.deepEqual(actions, [
+    { type: "mark_lost_pane", worker: "orch-worker-1", paneId: "w1:p2", title: "LOST orch-worker-1 #101" },
+  ]);
+});
+
+test("tick: lost worker with pr number -> pane title names the pr", () => {
+  const state = initState(1);
+  state.workers.push(makeWorker({ prNumber: 1092 }));
+  const { actions } = tick(state, { liveAgents: [], paneScreen: null, pr: null, repoSlug: "o/r" }, baseConfig(), T0 + 10);
+  assert.deepEqual(actions, [
+    { type: "mark_lost_pane", worker: "orch-worker-1", paneId: "w1:p2", title: "LOST orch-worker-1 #101 pr=1092" },
+  ]);
+});
+
+test("tick: lost worker without recorded paneId -> lost event only, no mark action", () => {
+  const state = initState(1);
+  state.workers.push(makeWorker({ paneId: null }));
+  const { actions, events } = tick(state, { liveAgents: [], paneScreen: null, pr: null, repoSlug: "o/r" }, baseConfig(), T0 + 10);
+  assert.equal(events[0].code, "WORKER_LOST");
+  assert.deepEqual(actions, []);
 });
 
 test("tick: pane gone after merge -> close action + CYCLE_DONE (defensive)", () => {
