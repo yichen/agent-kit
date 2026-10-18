@@ -120,9 +120,9 @@ Tier 3 (escalate to the human): the orchestrator session decides; prod
 data, consent/child-data, and legal boundaries are never auto-answered.
 
 Configuration is per consuming repo in `.pi/orchestrator.json` (all keys
-optional except none — defaults encode maxWorkers 1, pi on
-`ollama/qwen3.8:27b-mlx-128k`, 15-minute stall window, 5 CI rounds, empty
-dialog allowlist). Unknown keys, malformed values, or an invalid regex
+optional except none — defaults encode maxWorkers 1, pi on the Splash
+provider with `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`, 15-minute stall window,
+5 CI rounds, empty dialog allowlist). Unknown keys, malformed values, or an invalid regex
 disable the watcher instead of guessing. State persists outside any repo at
 `${AGENTS_ARTIFACTS_ROOT:-$HOME/agents-artifacts}/orchestrator/state.json`
 and is reconciled against live herdr truth every tick; herdr is the source
